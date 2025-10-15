@@ -14,431 +14,396 @@ import time
 import re
 from datetime import datetime
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import gtts
-import hashlib
-import logging
-from concurrent.futures import ThreadPoolExecutor
-import warnings
-warnings.filterwarnings("ignore")
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    print("sklearn not available, using simple search")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    import gtts
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
 
-# Load environment variables
 load_dotenv()
 
-# Safe API key loading
 API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
 if not API_KEY:
-    st.error("❌ GEMINI_API_KEY required!")
+    st.error("GEMINI_API_KEY required in secrets or .env")
     st.stop()
 
 try:
     genai.configure(api_key=API_KEY)
-    model = genai.GenerativeModel(
-        'gemini-2.5-flash',
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.3,  # Low for concise answers
-            top_p=0.8,
-            max_output_tokens=500  # Concise responses
-        )
-    )
-    st.sidebar.success("✅ Fast NotebookLM Ready!")
-except Exception as e:
-    logger.error(f"API Error: {e}")
-    st.error("❌ API Connection Failed!")
-    st.stop()
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    st.session_state.model_ready = True
+except:
+    st.session_state.model_ready = False
+    st.error("Model connection failed")
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def safe_hash(content):
-    """Safe content hashing"""
-    return hashlib.md5(content.encode()).hexdigest()
-
-class FastNotebookLM:
+class NotebookLM:
     def __init__(self):
+        self.content = ""
         self.chunks = []
-        self.rag_index = None
         self.metadata = {}
-        self.summary = ""
-        self.is_processed = False
-        self.progress = 0
+        self.sources = []
+        self.guide = ""
+        self.audio = None
         
-    def update_progress(self, step, total_steps):
-        """Update processing progress"""
-        self.progress = (step / total_steps) * 100
-        if hasattr(st.session_state, 'progress_bar'):
-            st.session_state.progress_bar.progress(self.progress)
-    
-    def chunk_document(self, content, chunk_size=800, overlap=100):
-        """Fast semantic chunking"""
+    def safe_extract_text(self, uploaded_file):
+        """Safe text extraction with progress"""
+        file_name = uploaded_file.name.lower()
+        content = ""
+        
+        file_bytes = uploaded_file.read()
+        uploaded_file.seek(0)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        
         try:
-            sentences = re.split(r'(?<=[.!?])\s+', content)
-            chunks = []
-            for i in range(0, len(sentences), chunk_size//100):
-                chunk = ' '.join(sentences[i:i+chunk_size//100])
-                if len(chunk) > 50:
-                    chunks.append(chunk[:2000])  # Limit chunk size
-            self.chunks = chunks[:50]  # Limit total chunks for speed
-            return chunks
-        except Exception as e:
-            logger.error(f"Chunking error: {e}")
-            return [content[:5000]]
-    
-    def build_fast_rag(self):
-        """Fast TF-IDF RAG index"""
-        try:
-            if len(self.chunks) < 2:
-                return None
-            vectorizer = TfidfVectorizer(
-                max_features=2000, 
-                stop_words='english',
-                ngram_range=(1,2),
-                lowercase=True
-            )
-            embeddings = vectorizer.fit_transform(self.chunks)
-            self.rag_index = {'vectorizer': vectorizer, 'embeddings': embeddings}
-            return self.rag_index
-        except Exception as e:
-            logger.error(f"RAG build error: {e}")
-            return None
-    
-    def search_rag(self, query, top_k=3):
-        """Fast RAG search"""
-        try:
-            if not self.rag_index or len(self.chunks) == 0:
-                return [{'content': self.chunks[0][:500] if self.chunks else 'No content', 'score': 1.0}]
+            status_text = st.empty()
+            status_text.text(f"Processing {file_name}...")
             
-            vectorizer = self.rag_index['vectorizer']
-            embeddings = self.rag_index['embeddings']
-            
-            query_vec = vectorizer.transform([query.lower()])
-            similarities = cosine_similarity(query_vec, embeddings).flatten()
-            
-            top_indices = np.argsort(similarities)[-top_k:][::-1]
-            results = []
-            for idx in top_indices:
-                if similarities[idx] > 0.1:  # Relevance threshold
-                    results.append({
-                        'content': self.chunks[idx],
-                        'score': float(similarities[idx])
-                    })
-            return results if results else [{'content': self.chunks[0][:500], 'score': 0.5}]
-        except Exception as e:
-            logger.error(f"RAG search error: {e}")
-            return [{'content': 'Search temporarily unavailable', 'score': 0}]
-    
-    def extract_content(self, uploaded_file):
-        """Fast, error-proof content extraction"""
-        try:
-            self.progress = 0
-            file_name = uploaded_file.name
-            content = ""
-            
-            # Step 1: Save file
-            self.update_progress(1, 5)
-            file_content = uploaded_file.read()
-            uploaded_file.seek(0)
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp:
-                tmp.write(file_content)
-                tmp_path = tmp.name
-            
-            # Step 2: Extract based on type
-            self.update_progress(2, 5)
-            if file_name.lower().endswith('.ipynb'):
+            if file_name.endswith('.ipynb'):
                 content = self._extract_notebook(tmp_path)
-            elif file_name.lower().endswith('.pdf'):
+            elif file_name.endswith('.pdf'):
                 content = self._extract_pdf(tmp_path)
-            else:  # Text files
-                with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f"# 📄 {file_name}\n\n" + f.read()
+            else:
+                content = self._extract_text(tmp_path)
+                
+            self.content = content[:100000]  # Limit size
+            self.metadata = {"filename": uploaded_file.name, "type": file_name.split('.')[-1]}
             
-            # Cleanup
-            os.unlink(tmp_path)
-            
-            # Step 3: Chunking
-            self.update_progress(3, 5)
-            self.chunk_document(content)
-            
-            # Step 4: RAG indexing
-            self.update_progress(4, 5)
-            self.build_fast_rag()
-            
-            self.metadata = {
-                'filename': file_name,
-                'chunks': len(self.chunks),
-                'size': len(content),
-                'processed_at': datetime.now().isoformat()
-            }
-            
-            self.is_processed = True
-            self.update_progress(5, 5)
+            status_text.text("✓ Content extracted successfully")
             return True
             
         except Exception as e:
-            logger.error(f"Extraction error: {e}")
-            st.error(f"Processing failed: {str(e)}")
+            st.error(f"Extraction failed: {str(e)}")
             return False
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
     
     def _extract_notebook(self, path):
-        """Extract notebook content"""
         try:
             nb = nbformat.read(path, as_version=4)
-            content = "# 📓 JUPYTER NOTEBOOK\n"
-            for i, cell in enumerate(nb.cells[:15]):  # Limit cells
+            content = "NOTEBOOK:\n"
+            for cell in nb.cells[:20]:
                 if cell.cell_type == 'code':
-                    content += f"\n## Code {i+1}\n```{cell.source[:1000]}\n```\n"
+                    content += f"CODE:\n{cell.source[:2000]}\n\n"
                 else:
-                    content += f"\n## {cell.source[:500]}\n"
+                    content += f"MARKDOWN:\n{cell.source[:1000]}\n\n"
             return content
         except:
-            return "# Notebook extraction failed"
+            return "Notebook content unavailable"
     
     def _extract_pdf(self, path):
-        """Extract PDF content"""
         try:
             reader = PdfReader(path)
-            content = "# 📄 PDF DOCUMENT\n"
-            for i, page in enumerate(reader.pages[:20]):  # Limit pages
+            content = "PDF DOCUMENT:\n"
+            for i, page in enumerate(reader.pages[:25]):
                 try:
                     text = page.extract_text()
-                    if text and len(text.strip()) > 10:
-                        content += f"\n## Page {i+1}\n{text[:1500]}\n"
+                    if text.strip():
+                        content += f"PAGE {i+1}:\n{text[:1500]}\n\n"
                 except:
                     continue
             return content
         except:
-            return "# PDF extraction failed"
+            return "PDF content unavailable"
     
-    def generate_concise_summary(self):
-        """Fast summary generation"""
+    def _extract_text(self, path):
         try:
-            if not self.chunks:
-                return "No content to summarize"
-            
-            context = ' '.join(self.chunks[:5])  # Use top chunks
-            prompt = f"""
-            Provide a CONCISE summary (3-5 sentences max) of this document:
-            Focus on MAIN POINTS only.
-            {context}
-            """
-            
-            response = model.generate_content(prompt)
-            self.summary = response.text
-            return response.text
-        except Exception as e:
-            logger.error(f"Summary error: {e}")
-            return "Summary generation failed"
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except:
+            return "Text content unavailable"
     
-    def generate_fast_response(self, query):
-        """Fast, relevant RAG-powered response"""
+    def simple_search(self, query):
+        """Simple keyword search when sklearn unavailable"""
+        if not self.chunks:
+            self.chunks = [self.content[i:i+2000] for i in range(0, len(self.content), 2000)]
+        
+        query_words = set(query.lower().split())
+        best_match = max(self.chunks, key=lambda chunk: len(query_words.intersection(set(chunk.lower().split()))))
+        return [best_match]
+    
+    def rag_search(self, query):
+        """RAG search with fallback"""
+        if SKLEARN_AVAILABLE and len(self.chunks) > 1:
+            try:
+                vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+                X = vectorizer.fit_transform(self.chunks)
+                query_vec = vectorizer.transform([query])
+                similarities = cosine_similarity(query_vec, X).flatten()
+                top_idx = np.argmax(similarities)
+                return [self.chunks[top_idx]]
+            except:
+                pass
+        
+        # Fallback to simple search
+        return self.simple_search(query)
+    
+    def generate_response(self, query):
+        """Generate focused response"""
         try:
-            # Get relevant context
-            relevant = self.search_rag(query, top_k=2)
-            context = '\n'.join([r['content'][:800] for r in relevant])
+            context = '\n'.join(self.rag_search(query))
             
             prompt = f"""
-            Answer this question using ONLY the provided context:
-            Be CONCISE and RELEVANT. Max 3-4 sentences.
+            Using only this document context, answer concisely:
             
-            RELEVANT CONTEXT:
-            {context}
+            CONTEXT: {context[:4000]}
             
             QUESTION: {query}
             
-            Direct, focused answer:
+            Give direct, relevant answer only.
             """
             
             response = model.generate_content(prompt)
             return response.text.strip()
         except Exception as e:
-            logger.error(f"Response error: {e}")
-            return "Sorry, I couldn't process that request."
+            return f"Response error: {str(e)}"
     
-    def generate_audio_fast(self, text):
-        """Fast audio generation"""
+    def generate_guide(self):
+        """Generate study guide"""
         try:
-            if len(text) > 300:  # Limit for speed
-                text = text[:300]
+            prompt = f"""
+            Create concise study guide for:
+            {self.content[:20000]}
             
-            tts = gtts.gTTS(text, lang='en', slow=False)
+            Include:
+            - Key concepts
+            - Main points
+            - Important terms
+            
+            Keep brief and structured.
+            """
+            response = model.generate_content(prompt)
+            self.guide = response.text
+            return self.guide
+        except:
+            return "Guide generation failed"
+    
+    def generate_audio(self, text):
+        """Generate audio with fallback"""
+        if not GTTS_AVAILABLE:
+            return None
+        try:
+            tts = gtts.gTTS(text[:300], lang='en')
             audio_bytes = io.BytesIO()
             tts.write_to_fp(audio_bytes)
             audio_bytes.seek(0)
             return audio_bytes.getvalue()
-        except Exception as e:
-            logger.error(f"Audio error: {e}")
+        except:
             return None
-    
-    def search_images_fast(self, query):
-        """Fast image search with Unsplash source"""
-        try:
-            # Using Unsplash source URLs (no API key needed)
-            base_url = "https://source.unsplash.com"
-            search_query = query.replace(' ', '+')[:20]  # Limit query length
-            image_urls = [
-                f"{base_url}/400x300/?{search_query}",
-                f"{base_url}/400x300/?{search_query},document",
-                f"{base_url}/400x300/?{search_query},study"
-            ]
-            return image_urls[:2]  # Limit for speed
-        except:
-            return ["https://via.placeholder.com/400x300?text=Image"]
-    
-    def fetch_image_safe(self, url):
-        """Safe image fetching with timeout"""
-        try:
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                img = Image.open(BytesIO(response.content))
-                return img.resize((300, 200), Image.Resampling.LANCZOS)
-        except:
-            pass
-        return None
 
-# Streamlit App
-def main():
-    st.set_page_config(
-        page_title="Fast NotebookLM", 
-        page_icon="⚡", 
-        layout="wide"
+# Custom CSS to match NotebookLM
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&display=swap');
+    
+.main {
+    font-family: 'Google Sans', sans-serif;
+}
+
+.stApp {
+    background-color: #fafafa;
+}
+
+.header-section {
+    background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%);
+    color: white;
+    padding: 2rem;
+    border-radius: 16px;
+    margin-bottom: 2rem;
+    text-align: center;
+}
+
+.upload-area {
+    background: white;
+    padding: 2rem;
+    border-radius: 12px;
+    border: 2px dashed #e5e7eb;
+    text-align: center;
+    margin: 1rem 0;
+}
+
+.source-card {
+    background: white;
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    margin: 1rem 0;
+}
+
+.chat-bubble {
+    background: white;
+    border-radius: 18px;
+    padding: 1rem 1.5rem;
+    margin: 0.5rem 0;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+}
+
+.notebooklm-blue {
+    color: #1e40af;
+}
+
+.guide-section {
+    background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+    border-left: 4px solid #3b82f6;
+    padding: 1.5rem;
+    border-radius: 8px;
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0.5rem;
+}
+
+.stTabs [data-baseweb="tab"] {
+    border-radius: 8px 8px 0 0;
+    padding: 0.75rem 1.5rem;
+}
+
+.sidebar .sidebar-content {
+    background: #f8fafc;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session
+if "notebook" not in st.session_state:
+    st.session_state.notebook = NotebookLM()
+if "sources" not in st.session_state:
+    st.session_state.sources = []
+if "chat" not in st.session_state:
+    st.session_state.chat = []
+
+# Header - NotebookLM Style
+st.markdown("""
+<div class="header-section">
+    <h1 style="margin: 0; font-weight: 700;">NotebookLM</h1>
+    <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">Your notebook. Your AI assistant.</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Main content area
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    # Upload section
+    st.markdown('<div class="upload-area">', unsafe_allow_html=True)
+    uploaded_file = st.file_uploader(
+        "Upload your first source", 
+        type=['pdf', 'ipynb', 'txt', 'md', 'py'],
+        help="Supports PDFs, notebooks, and text files"
     )
     
-    # Custom CSS for fast, clean UI
-    st.markdown("""
-    <style>
-    .fast-header {background: linear-gradient(135deg, #00c6ff, #0072ff); color: white; padding: 2rem; border-radius: 15px; text-align: center;}
-    .feature-card {background: white; padding: 1rem; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin: 0.5rem 0;}
-    .rag-result {background: #e3f2fd; padding: 0.8rem; border-radius: 5px; margin: 0.3rem 0; font-size: 0.9em;}
-    .concise-answer {background: #e8f5e8; padding: 1rem; border-radius: 8px; border-left: 4px solid #4caf50;}
-    .progress-container {background: #f0f0f0; padding: 1rem; border-radius: 10px;}
-    </style>
-    """, unsafe_allow_html=True)
+    if uploaded_file is not None and st.button("Add Source", key="add_source"):
+        with st.spinner("Processing document..."):
+            if st.session_state.notebook.safe_extract_text(uploaded_file):
+                st.session_state.sources.append({
+                    "name": uploaded_file.name,
+                    "added": datetime.now().strftime("%H:%M")
+                })
+                st.success(f"✓ {uploaded_file.name} added")
+                st.rerun()
     
-    # Header
-    st.markdown('<div class="fast-header"><h1>⚡ Fast NotebookLM</h1><p>Instant document insights with RAG & progress tracking</p></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
     
-    # Initialize session
-    if "nllm" not in st.session_state:
-        st.session_state.nllm = FastNotebookLM()
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    
-    # Sidebar
-    with st.sidebar:
-        st.header("📁 Upload")
-        uploaded_file = st.file_uploader("Choose document", type=['pdf', 'ipynb', 'txt', 'py', 'md'])
-        
-        if uploaded_file and st.button("🚀 Process Fast", use_container_width=True):
-            with st.spinner("Processing..."):
-                # Progress bar
-                progress_bar = st.progress(0)
-                st.session_state.progress_bar = progress_bar
-                
-                success = st.session_state.nllm.extract_content(uploaded_file)
-                if success:
-                    st.success(f"✅ Processed {st.session_state.nllm.metadata.get('chunks', 0)} chunks")
-                    st.session_state.processed = True
-                else:
-                    st.error("Processing failed")
-    
-    # Main tabs
-    if hasattr(st.session_state, 'processed') and st.session_state.processed:
-        tab1, tab2, tab3, tab4 = st.tabs(["📋 Summary", "🔍 RAG Search", "💬 Fast Chat", "🎵 Audio"])
-        
-        with tab1:
-            st.markdown('<div class="feature-card">', unsafe_allow_html=True)
-            st.header("📋 Instant Summary")
-            if st.button("✨ Generate Summary"):
-                with st.spinner("Summarizing..."):
-                    summary = st.session_state.nllm.generate_concise_summary()
-                    st.markdown(f'<div class="concise-answer"><strong>Summary:</strong> {summary}</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Metrics
-            col1, col2 = st.columns(2)
-            with col1: st.metric("📄 Chunks", st.session_state.nllm.metadata.get('chunks', 0))
-            with col2: st.metric("⚡ Status", "RAG Ready")
-        
-        with tab2:
-            st.markdown('<div class="feature-card">', unsafe_allow_html=True)
-            st.header("🔍 Lightning RAG Search")
-            query = st.text_input("Search document...", key="rag_query")
-            
-            if query or st.button("🔎 Search"):
-                with st.spinner("Searching..."):
-                    results = st.session_state.nllm.search_rag(query)
-                    for i, result in enumerate(results):
-                        st.markdown(f"""
-                        <div class="rag-result">
-                        <strong>#{i+1} ({result['score']:.1%})</strong><br>
-                        {result['content'][:300]}...
-                        </div>
-                        """, unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with tab3:
-            st.markdown('<div class="feature-card">', unsafe_allow_html=True)
-            st.header("💬 Fast AI Chat")
-            
-            # Chat history
-            for msg in st.session_state.chat_history[-6:]:  # Last 6 messages
-                with st.chat_message(msg["role"]):
-                    st.markdown(msg["content"])
-            
-            # Chat input
-            if prompt := st.chat_input("Ask about document..."):
-                st.session_state.chat_history.append({"role": "user", "content": prompt})
-                with st.chat_message("user"):
-                    st.markdown(prompt)
-                
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking fast..."):
-                        answer = st.session_state.nllm.generate_fast_response(prompt)
-                        st.markdown(f'<div class="concise-answer">{answer}</div>', unsafe_allow_html=True)
-                    
-                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with tab4:
-            st.markdown('<div class="feature-card">', unsafe_allow_html=True)
-            st.header("🎵 Quick Audio")
-            text = st.text_area("Text to speak", height=80, placeholder="Or use summary...")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("🔊 Generate Audio"):
-                    with st.spinner("Creating audio..."):
-                        audio_data = st.session_state.nllm.generate_audio_fast(text or st.session_state.nllm.summary)
-                        if audio_data:
-                            st.audio(audio_data)
-                            st.success("Audio ready!")
-                        else:
-                            st.warning("Audio generation failed")
-            st.markdown('</div>', unsafe_allow_html=True)
-    
-    else:
-        # Welcome screen
-        st.info("""
-        🚀 **Fast NotebookLM Features:**
-        • ⚡ **Lightning Processing** - Progress bars + caching
-        • 🔍 **Smart RAG** - Semantic document search  
-        • 💬 **Concise Answers** - No fluff, just relevant info
-        • 🎵 **Instant Audio** - Text-to-speech summaries
-        • 🛡️ **Error-Proof** - Safe extraction & fallbacks
-        
-        **Upload your document to start!** (PDF, notebooks, code, text)
-        """)
-    
-    # Global controls
-    if st.sidebar.button("🗑️ Clear All", use_container_width=True):
-        for key in list(st.session_state.keys()):
-            if key not in ['nllm']:
-                del st.session_state[key]
-        st.rerun()
+    # Sources list
+    if st.session_state.sources:
+        st.subheader("Sources")
+        for i, source in enumerate(st.session_state.sources):
+            st.markdown(f"""
+            <div class="source-card">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <strong>{source['name']}</strong><br>
+                        <small style="color: #6b7280;">Added {source['added']}</small>
+                    </div>
+                    <button style="background: #ef4444; color: white; border: none; border-radius: 6px; padding: 0.25rem 0.5rem; cursor: pointer;" onclick="this.parentElement.parentElement.remove()">×</button>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-if __name__ == "__main__":
-    main()
+with col2:
+    st.markdown("""
+    <div style="background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+        <h3 style="color: #1e40af; margin-top: 0;">What can I help with?</h3>
+        <ul style="color: #6b7280; line-height: 1.6;">
+            <li>Summarize key points</li>
+            <li>Explain concepts</li>
+            <li>Create study guides</li>
+            <li>Answer questions</li>
+            <li>Generate audio overviews</li>
+        </ul>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Main tabs
+if st.session_state.sources:
+    tab1, tab2, tab3 = st.tabs(["Notebook", "Chat", "Guide"])
+    
+    with tab1:
+        st.markdown('<div class="guide-section">', unsafe_allow_html=True)
+        st.subheader("Notebook Guide")
+        
+        if st.button("Generate Guide", key="gen_guide"):
+            with st.spinner("Creating guide..."):
+                guide = st.session_state.notebook.generate_guide()
+                st.markdown(f"### Key Concepts\n{guide}")
+        
+        # Audio generation
+        if st.button("Generate Audio Overview", key="gen_audio"):
+            with st.spinner("Creating audio..."):
+                audio = st.session_state.notebook.generate_audio(st.session_state.notebook.guide or st.session_state.notebook.content[:500])
+                if audio:
+                    st.audio(audio)
+                else:
+                    st.warning("Audio generation unavailable")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    with tab2:
+        st.subheader("Ask questions about your sources")
+        
+        # Chat interface
+        for message in st.session_state.chat[-10:]:
+            with st.chat_message(message["role"]):
+                st.markdown(f'<div class="chat-bubble">{message["content"]}</div>', unsafe_allow_html=True)
+        
+        if prompt := st.chat_input("Ask a question..."):
+            st.session_state.chat.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(f'<div class="chat-bubble">{prompt}</div>', unsafe_allow_html=True)
+            
+            with st.chat_message("assistant"):
+                with st.spinner("NotebookLM is thinking..."):
+                    response = st.session_state.notebook.generate_response(prompt)
+                    st.markdown(f'<div class="chat-bubble">{response}</div>', unsafe_allow_html=True)
+                
+                st.session_state.chat.append({"role": "assistant", "content": response})
+    
+    with tab3:
+        st.subheader("Source Details")
+        st.text_area("Content Preview", st.session_state.notebook.content[:2000], height=300, disabled=True)
+
+# Footer
+st.markdown("""
+<div style="text-align: center; padding: 2rem; color: #6b7280; border-top: 1px solid #e5e7eb; margin-top: 2rem;">
+    <p>Powered by Google Gemini • Your personal AI research assistant</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Clear session
+if st.sidebar.button("Clear All Sources"):
+    st.session_state.sources = []
+    st.session_state.chat = []
+    st.session_state.notebook = NotebookLM()
+    st.rerun()
