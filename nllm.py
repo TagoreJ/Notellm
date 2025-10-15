@@ -5,211 +5,220 @@ from PyPDF2 import PdfReader
 import os
 import tempfile
 import json
-from pathlib import Path
-import pydot
 from io import BytesIO
+from dotenv import load_dotenv
+import base64
 
-# ================= Streamlit Cloud Secret Loading =================
-# Use secrets.toml for GEMINI_API_KEY
-if "GEMINI_API_KEY" not in st.secrets:
-    st.error("❌ GEMINI_API_KEY missing in Streamlit secrets.")
+# Load environment variables
+load_dotenv()
+
+# Configuration
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not API_KEY:
+    st.error("❌ GEMINI_API_KEY not found! Add to `.env` file.")
     st.stop()
 
-API_KEY = st.secrets["GEMINI_API_KEY"]
-
-# ================= Initialize Gemini Model =================
+# Configure Gemini with updated model
 try:
     genai.configure(api_key=API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash-exp")
-    st.sidebar.success("✅ Gemini 2.0 Connected via Streamlit Secrets!")
+    # Use the latest stable model (Oct 2025)
+    model = genai.GenerativeModel('gemini-2.5-flash')
+    st.sidebar.success("✅ Gemini 2.5 Connected!")
 except Exception as e:
-    st.error(f"❌ Gemini API Error: {e}")
-    st.info("💡 Update SDK: pip install --upgrade google-generativeai")
+    st.error(f"❌ API Error: {str(e)}")
     st.stop()
 
-# ================= File Extraction =================
-def extract_notebook_content(nb):
-    content = "# 📓 JUPYTER NOTEBOOK\n\n"
-    try:
-        for i, cell in enumerate(nb.cells, 1):
-            if cell.cell_type == "markdown":
-                content += f"## Markdown Cell {i}\n{cell.source}\n\n"
-            elif cell.cell_type == "code":
-                content += f"## Code Cell {i}\n``````\n\n"
-                if cell.get("outputs"):
-                    outputs = json.dumps(cell.outputs, indent=2)[:1000]
-                    content += f"### Outputs:\n{outputs}\n\n"
-        return content
-    except Exception as e:
-        return f"Error parsing notebook: {str(e)}"
-
-def extract_text_content(file_path, file_name):
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        return f"# 📄 {Path(file_name).stem.upper()}\n\n{content}"
-    except:
-        return "Error reading text file"
-
-def extract_pdf_content(file_path):
-    try:
-        reader = PdfReader(file_path)
-        content = "# 📄 PDF DOCUMENT\n\n"
-        for i, page in enumerate(reader.pages[:10], 1):
-            text = page.extract_text()
-            if text and text.strip():
-                content += f"## Page {i}\n{text[:2000]}\n\n"
-        return content if content != "# 📄 PDF DOCUMENT\n\n" else "No text extracted from PDF"
-    except Exception as e:
-        return f"Error parsing PDF: {str(e)}"
-
-@st.cache_data
-def process_uploaded_file(uploaded_file):
+def extract_text_from_file(uploaded_file):
+    """Extract content from various file types"""
     file_name = uploaded_file.name.lower()
+    content = ""
+    
     file_content = uploaded_file.read()
     uploaded_file.seek(0)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_name).suffix) as tmp:
-        tmp.write(file_content)
-        tmp_path = tmp.name
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp_file:
+        tmp_file.write(file_content)
+        tmp_file_path = tmp_file.name
+    
     try:
-        if file_name.endswith(".ipynb"):
-            nb = nbformat.read(tmp_path, as_version=4)
-            return extract_notebook_content(nb)
-        elif file_name.endswith((".txt", ".py", ".md", ".r", ".js", ".cpp", ".java", ".json")):
-            return extract_text_content(tmp_path, file_name)
-        elif file_name.endswith(".pdf"):
-            return extract_pdf_content(tmp_path)
+        if file_name.endswith('.ipynb'):
+            nb = nbformat.read(tmp_file_path, as_version=4)
+            content = "# 📓 JUPYTER NOTEBOOK\n\n"
+            for i, cell in enumerate(nb.cells, 1):
+                if cell.cell_type == 'markdown':
+                    content += f"## Markdown Cell {i}\n{cell.source}\n\n"
+                elif cell.cell_type == 'code':
+                    content += f"## Code Cell {i}\n```python\n{cell.source}\n```\n"
+                    if cell.get('outputs'):
+                        content += f"### Outputs:\n{json.dumps(cell.outputs, indent=2)[:1000]}\n\n"
+        
+        elif file_name.endswith(('.txt', '.py', '.md', '.R', '.js', '.cpp', '.java')):
+            with open(tmp_file_path, 'r', encoding='utf-8') as f:
+                content = f"# 📄 {file_name.upper()}\n\n{f.read()}"
+        
+        elif file_name.endswith('.pdf'):
+            reader = PdfReader(tmp_file_path)
+            content = "# 📄 PDF DOCUMENT\n\n"
+            for i, page in enumerate(reader.pages[:10], 1):
+                try:
+                    text = page.extract_text()
+                    if text and text.strip():
+                        content += f"## Page {i}\n{text[:2000]}\n\n"
+                except:
+                    continue
+        
         else:
-            return f"Unsupported file: {file_name}"
+            return f"Unsupported file type: {file_name}"
+    
     finally:
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_file_path)
+        except:
+            pass
+    
+    return content[:300000]  # Limit for token constraints
 
-# ================= Mind Map Generators =================
-def create_mind_map_from_notebook(nb):
-    graph = pydot.Dot(graph_type="graph", rankdir="LR")
-    root = pydot.Node("Notebook", style="filled", fillcolor="lightblue", shape="box")
-    graph.add_node(root)
-
-    for i, cell in enumerate(nb.cells, 1):
-        if cell.cell_type == "markdown":
-            label = cell.source.strip().split("\n")[0][:40]
-            node = pydot.Node(f"MD {i}: {label}", shape="note")
-        elif cell.cell_type == "code":
-            node = pydot.Node(f"Code Cell {i}", shape="box", style="filled", fillcolor="lightgrey")
-        else:
-            continue
-        graph.add_node(node)
-        graph.add_edge(pydot.Edge(root, node))
-    return graph.to_string()
-
-def create_mind_map_from_text(text_content):
-    graph = pydot.Dot(graph_type="graph", rankdir="LR")
-    root = pydot.Node("Document", style="filled", fillcolor="lightgreen", shape="box")
-    graph.add_node(root)
-
-    lines = text_content.split("\n")
-    count = 0
-    for line in lines:
-        line = line.strip()
-        if line and (line.startswith("#") or len(line) < 80 and len(line.split()) < 8):
-            label = line[:40]
-            node = pydot.Node(f"{label}_{count}", label=label, shape="ellipse")
-            graph.add_node(node)
-            graph.add_edge(pydot.Edge(root, node))
-            count += 1
-            if count > 15:
-                break
-    return graph.to_string()
-
-def render_mind_map(graph_str):
-    graphs = pydot.graph_from_dot_data(graph_str)
-    if graphs:
-        graph = graphs[0]
-        return graph.create_png()
-    return None
-
-# ================= AI Response =================
-def generate_ai_response(prompt, context):
+def generate_response(prompt, file_content):
+    """Generate AI response using file context"""
     try:
         system_prompt = f"""
-You are a helpful document analysis assistant.
-Use the content below to answer questions with structure and clarity.
+You are an expert document and code analysis assistant. Answer questions based ONLY on the provided context.
+Be specific, reference sections or code when possible, and provide helpful insights.
 
-CONTEXT:
-{context}
+CONTEXT FROM UPLOADED FILE:
+{file_content}
 
-QUESTION:
-{prompt}
+USER QUESTION: {prompt}
+
+Provide a clear, accurate response using the context above.
 """
         response = model.generate_content(system_prompt)
         return response.text
     except Exception as e:
-        return f"Error generating response: {e}"
+        return f"❌ Error: {str(e)}"
 
-# ================= Streamlit UI =================
+# Streamlit UI
 st.set_page_config(
-    page_title="Notebook LLM + Mind Map",
-    page_icon="🧠",
+    page_title="Notebook LLM", 
+    page_icon="📓", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.title("📓 Notebook LLM + 🧠 Mind Map (Streamlit Cloud Ready)")
-st.markdown("Chat with your notebooks, visualize key ideas with a Mind Map, and explore using Gemini 2.0!")
+st.title("📓 Notebook LLM - File Analysis Assistant")
+st.markdown("Upload documents and chat about their content using Gemini 2.5!")
 
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Settings")
+    st.info("**Supported Files:**")
+    st.write("• 📓 Jupyter `.ipynb`")
+    st.write("• 💻 Code: `.py`, `.js`, `.cpp`, `.java`")
+    st.write("• 📝 Text: `.txt`, `.md`")
+    st.write("• 📄 PDF files")
+    
+    st.markdown("---")
+    st.info("🆓 **Free Tier Ready** - Uses Gemini 2.5 Flash")
+    
+    if st.button("🔑 Get API Key"):
+        st.markdown("[Google AI Studio](https://aistudio.google.com/app/apikey)")
+
+# File upload
 uploaded_file = st.file_uploader(
-    "📁 Upload Document",
-    type=["ipynb", "py", "txt", "md", "r", "js", "cpp", "java", "json", "pdf"],
-    help="Upload your notebook or document"
+    "📁 Upload a file to analyze",
+    type=['ipynb', 'py', 'txt', 'md', 'R', 'js', 'cpp', 'java', 'pdf']
 )
 
+# Session state
 if "file_content" not in st.session_state:
     st.session_state.file_content = ""
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "mind_map_img" not in st.session_state:
-    st.session_state.mind_map_img = None
+if "filename" not in st.session_state:
+    st.session_state.filename = ""
 
-if uploaded_file:
-    file_name = uploaded_file.name.lower()
-    with st.spinner("🔍 Reading and processing..."):
-        content = process_uploaded_file(uploaded_file)
+# Process uploaded file
+if uploaded_file is not None:
+    with st.spinner("🔄 Extracting content..."):
+        content = extract_text_from_file(uploaded_file)
         st.session_state.file_content = content
-
-        # Generate Mind Map
-        if file_name.endswith(".ipynb"):
-            nb = nbformat.reads(uploaded_file.getvalue().decode("utf-8"), as_version=4)
-            mind_map_dot = create_mind_map_from_notebook(nb)
-        else:
-            mind_map_dot = create_mind_map_from_text(content)
-        st.session_state.mind_map_img = render_mind_map(mind_map_dot)
-
-    st.success(f"✅ Loaded: {uploaded_file.name}")
-
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.subheader("💬 Chat with AI")
-        for msg in st.session_state.messages[-8:]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-        if prompt := st.chat_input("Ask something about your document..."):
+        st.session_state.filename = uploaded_file.name
+    
+    if not content.startswith(("Error", "Unsupported")):
+        st.success(f"✅ Loaded: **{st.session_state.filename}**")
+        
+        # File preview
+        with st.expander("📋 File Preview", expanded=True):
+            st.text_area(
+                "Content", 
+                st.session_state.file_content[:3000], 
+                height=250, 
+                disabled=True
+            )
+        
+        # Chat interface
+        st.subheader("💬 Ask Questions About Your File")
+        
+        # Display chat history
+        for message in st.session_state.messages[-8:]:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        
+        # Chat input
+        if prompt := st.chat_input("Ask about your document (e.g., 'Summarize this', 'Explain the code')"):
+            # Add user message
             st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Generate AI response
             with st.chat_message("assistant"):
-                with st.spinner("🤔 Thinking..."):
-                    ans = generate_ai_response(prompt, st.session_state.file_content)
-                    st.markdown(ans)
-                    st.session_state.messages.append({"role": "assistant", "content": ans})
+                with st.spinner("🤔 Gemini is analyzing..."):
+                    response = generate_response(prompt, st.session_state.file_content)
+                    st.markdown(response)
+                
+                st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # Action buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🗑️ Clear Chat"):
+                st.session_state.messages = []
+                st.rerun()
+        with col2:
+            if st.button("🔄 Upload New File"):
+                st.session_state.file_content = ""
+                st.session_state.messages = []
+                st.session_state.filename = ""
+                st.rerun()
+    else:
+        st.error(f"❌ {content}")
 
-    with col2:
-        st.subheader("🧠 Mind Map View")
-        if st.session_state.mind_map_img:
-            st.image(st.session_state.mind_map_img, use_column_width=True)
-        else:
-            st.info("Mind map appears here after processing.")
+# Welcome message for new users
+if uploaded_file is None and not st.session_state.messages:
+    st.info("""
+    🚀 **How to use Notebook LLM:**
+    1. **Upload** a Jupyter notebook, code file, PDF, or text document
+    2. **Wait** for content extraction (automatic)
+    3. **Chat** - Ask questions about your file in the input box below
+    4. **Get insights** - Gemini analyzes and responds based on your content!
+    
+    💡 **Example questions:**
+    • "Summarize this notebook in bullet points"
+    • "Explain what this function does"
+    • "What libraries are used?"
+    • "Find bugs in the code"
+    """)
 
-else:
-    st.info("📂 Upload a `.ipynb`, `.pdf`, or `.py` file to start.")
-
+# Footer
 st.markdown("---")
-st.caption("🚀 Built for Streamlit Cloud | Gemini 2.0 | Updated October 2025")
+st.markdown(
+    """
+    <div style='text-align: center; color: #666;'>
+        📓 Notebook LLM | Powered by Streamlit + Gemini 2.5 Flash<br>
+        <small>Free tier compatible | Oct 2025</small>
+    </div>
+    """, 
+    unsafe_allow_html=True
+)
