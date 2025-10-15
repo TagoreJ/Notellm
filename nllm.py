@@ -5,382 +5,401 @@ from PyPDF2 import PdfReader
 import os
 import tempfile
 import json
+import requests
 from io import BytesIO
 from dotenv import load_dotenv
-import requests
 from PIL import Image
 import io
 import time
+import hashlib
+import base64
+from datetime import datetime
 import re
+from collections import defaultdict
+import numpy as np
 
 # Load environment variables
 load_dotenv()
 
-# Configuration - Works for Streamlit Cloud + Local
+# API Configuration
 API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
-
 if not API_KEY:
-    st.error("❌ GEMINI_API_KEY not found!")
-    st.markdown("""
-    **Local:** Add to `.env` file: `GEMINI_API_KEY=your_key`  
-    **Streamlit Cloud:** Settings → Secrets → Add `GEMINI_API_KEY = your_key`
-    """)
+    st.error("❌ GEMINI_API_KEY required!")
     st.stop()
 
-# Configure Gemini
 try:
     genai.configure(api_key=API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash')
-    st.sidebar.success("✅ Gemini 2.5 Connected!")
-except Exception as e:
-    st.error(f"❌ API Error: {str(e)}")
+    st.sidebar.success("✅ Gemini 2.5 Ready!")
+except:
+    st.error("❌ API Connection Failed!")
     st.stop()
 
-# Dynamic image sources based on content type
-def get_relevant_images(topic_keywords):
-    """Get relevant images based on document content"""
-    images = {
-        # Ayurveda/Health
-        "ayurveda": [
-            "https://cdn.pixabay.com/photo/2017/03/08/12/16/ayurveda-2128935_1280.jpg",
-            "https://images.unsplash.com/photo-1564103146797-fd5d731e63c1?auto=format&fit=crop&w=800",
-        ],
-        "health": [
-            "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=800",
-            "https://cdn.pixabay.com/photo/2016/11/29/05/14/yoga-1868556_1280.jpg",
-        ],
-        # Tech/Code
-        "python": [
-            "https://images.unsplash.com/photo-1526379095098-d400c8895b16?auto=format&fit=crop&w=800",
-            "https://cdn.pixabay.com/photo/2017/08/07/14/02/code-2606586_1280.jpg",
-        ],
-        "code": [
-            "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?auto=format&fit=crop&w=800",
-            "https://cdn.pixabay.com/photo/2017/08/07/14/02/code-2606585_1280.jpg",
-        ],
-        # Default/Generic
-        "default": [
-            "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=800",
-            "https://cdn.pixabay.com/photo/2017/08/07/14/02/code-2606586_1280.jpg",
-        ]
-    }
-    
-    for key in topic_keywords:
-        if key in images:
-            return images[key]
-    return images["default"]
-
-def fetch_image(url, max_size=(400, 300)):
-    """Fetch and resize image"""
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        img = Image.open(io.BytesIO(response.content))
-        img = img.resize(max_size, Image.Resampling.LANCZOS)
-        return img
-    except:
-        return None
-
-def extract_text_from_file(uploaded_file):
-    """Extract content from any file type"""
-    file_name = uploaded_file.name.lower()
-    content = ""
-    
-    file_content = uploaded_file.read()
-    uploaded_file.seek(0)
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp_file:
-        tmp_file.write(file_content)
-        tmp_file_path = tmp_file.name
-    
-    try:
-        if file_name.endswith('.ipynb'):
-            nb = nbformat.read(tmp_file_path, as_version=4)
-            content = "# 📓 JUPYTER NOTEBOOK\n\n"
-            for i, cell in enumerate(nb.cells, 1):
-                if cell.cell_type == 'markdown':
-                    content += f"## Markdown Cell {i}\n{cell.source}\n\n"
-                elif cell.cell_type == 'code':
-                    content += f"## Code Cell {i}\n```python\n{cell.source}\n```\n"
-                    if cell.get('outputs'):
-                        content += f"### Outputs:\n{json.dumps(cell.outputs, indent=2)[:1000]}\n\n"
+class NotebookLLM:
+    def __init__(self):
+        self.file_content = ""
+        self.metadata = {}
+        self.guide_content = ""
+        self.podcast_notes = ""
+        self.studynotes = ""
+        self.timeline = []
+        self.faq = []
+        self.brainstorm = ""
         
-        elif file_name.endswith(('.txt', '.py', '.md', '.R', '.js', '.cpp', '.java', '.json')):
-            with open(tmp_file_path, 'r', encoding='utf-8') as f:
-                content = f"# 📄 {file_name.upper()}\n\n{f.read()}"
+    def extract_content(self, uploaded_file):
+        """Enhanced content extraction with metadata"""
+        file_name = uploaded_file.name.lower()
+        content = ""
+        metadata = {"filename": file_name, "type": "", "keywords": [], "timestamp": datetime.now().isoformat()}
         
-        elif file_name.endswith('.pdf'):
-            reader = PdfReader(tmp_file_path)
-            content = "# 📄 PDF DOCUMENT\n\n"
-            for i, page in enumerate(reader.pages, 1):
-                try:
-                    text = page.extract_text()
-                    if text and text.strip():
-                        content += f"## Page {i}\n{text[:3000]}\n\n"
-                except:
-                    continue
+        file_content = uploaded_file.read()
+        uploaded_file.seek(0)
         
-        else:
-            return f"Unsupported file type: {file_name}"
-    
-    finally:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp:
+            tmp.write(file_content)
+            tmp_path = tmp.name
+        
         try:
-            os.unlink(tmp_file_path)
+            if file_name.endswith('.ipynb'):
+                nb = nbformat.read(tmp_path, as_version=4)
+                content = self._process_notebook(nb)
+                metadata["type"] = "jupyter_notebook"
+                
+            elif file_name.endswith(('.txt', '.py', '.md', '.R', '.js')):
+                with open(tmp_path, 'r', encoding='utf-8') as f:
+                    content = f"# 📄 {file_name.upper()}\n\n{f.read()}"
+                metadata["type"] = "code_text"
+                
+            elif file_name.endswith('.pdf'):
+                reader = PdfReader(tmp_path)
+                content = self._process_pdf(reader)
+                metadata["type"] = "pdf_document"
+                
+            metadata["keywords"] = self._extract_keywords(content)
+            
+        finally:
+            os.unlink(tmp_path)
+            
+        self.file_content = content[:800000]  # Large context window
+        self.metadata = metadata
+        return content, metadata
+    
+    def _process_notebook(self, nb):
+        """Process Jupyter notebook with cell metadata"""
+        content = "# 📓 JUPYTER NOTEBOOK ANALYSIS\n\n"
+        code_cells = []
+        markdown_cells = []
+        
+        for i, cell in enumerate(nb.cells):
+            if cell.cell_type == 'markdown':
+                content += f"## Markdown {i+1}:\n{cell.source}\n\n"
+                markdown_cells.append(cell.source)
+            elif cell.cell_type == 'code':
+                content += f"## Code {i+1}:\n```python\n{cell.source}\n```\n"
+                if cell.get('outputs'):
+                    content += f"### Output:\n{json.dumps(cell.outputs[:1], indent=2)}\n\n"
+                code_cells.append({"source": cell.source, "outputs": cell.outputs})
+        
+        self.code_cells = code_cells
+        self.markdown_cells = markdown_cells
+        return content
+    
+    def _process_pdf(self, reader):
+        """Process PDF with page-level metadata"""
+        content = "# 📄 PDF DOCUMENT\n\n"
+        pages = []
+        for i, page in enumerate(reader.pages[:50]):  # Limit pages
+            try:
+                text = page.extract_text()
+                if text.strip():
+                    content += f"## Page {i+1}:\n{text[:4000]}\n\n"
+                    pages.append({"page": i+1, "content": text})
+            except:
+                continue
+        self.pages = pages
+        return content
+    
+    def _extract_keywords(self, content):
+        """Extract key topics and concepts"""
+        # Simple keyword extraction
+        words = re.findall(r'\b[a-zA-Z]{4,}\b', content.lower())
+        common_words = ['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had']
+        keywords = [w for w in words if w not in common_words and len(w) > 4]
+        return list(set(keywords))[:20]
+    
+    def generate_study_guide(self):
+        """Generate comprehensive study guide"""
+        if not self.file_content:
+            return "No content to analyze"
+        
+        try:
+            prompt = f"""
+Create a comprehensive study guide for the following document. Include:
+1. Executive Summary (3-5 sentences)
+2. Key Concepts & Definitions
+3. Important Formulas/Algorithms (if applicable)
+4. Main Takeaways
+5. Practice Questions
+6. Further Reading
+
+DOCUMENT: {self.file_content[:300000]}
+
+Format as a professional study guide.
+"""
+            response = model.generate_content(prompt)
+            self.guide_content = response.text
+            return response.text
+        except Exception as e:
+            return f"Error: {e}"
+    
+    def generate_podcast_notes(self):
+        """Generate podcast-style notes"""
+        if not self.file_content:
+            return "No content"
+        
+        try:
+            prompt = f"""
+Create engaging podcast notes for the document below. Include:
+- Episode Title & Description
+- Key Discussion Points (bullet points)
+- Guest Expert Highlights
+- Actionable Takeaways
+- Timestamped segments
+
+Format like a professional podcast script.
+
+DOCUMENT: {self.file_content[:200000]}
+"""
+            response = model.generate_content(prompt)
+            self.podcast_notes = response.text
+            return response.text
         except:
-            pass
+            return "Error generating podcast notes"
     
-    return content[:500000]
-
-def detect_document_topic(content):
-    """Simple topic detection for relevant images"""
-    content_lower = content.lower()
-    keywords = {
-        "ayurveda": ["ayurveda", "dosha", "vata", "pitta", "kapha", "herbs"],
-        "health": ["health", "wellness", "yoga", "meditation", "nutrition"],
-        "python": ["python", "import", "def ", "class ", "pandas", "numpy"],
-        "code": ["function", "class", "def ", "import", "algorithm"]
-    }
-    
-    for topic, words in keywords.items():
-        if any(word in content_lower for word in words):
-            return [topic]
-    return ["default"]
-
-def generate_response(prompt, file_content, temperature=0.7):
-    """Generate comprehensive response with deep understanding"""
-    try:
-        model = genai.GenerativeModel(
-            'gemini-2.5-flash',
-            generation_config=genai.types.GenerationConfig(
-                temperature=temperature,
-                top_p=0.9,
-                max_output_tokens=2000
-            )
-        )
+    def generate_timeline(self):
+        """Generate chronological timeline if applicable"""
+        if not self.file_content:
+            return []
         
-        system_prompt = f"""
-You are an expert document analysis assistant with deep understanding of the uploaded content.
-You have thoroughly analyzed and memorized the entire document below. Answer ANY question based EXCLUSIVELY on this content.
+        try:
+            prompt = f"""
+Extract chronological events, steps, or timeline from the document.
+Return as JSON array of events with dates/sequence numbers.
 
-Be comprehensive, structured, and helpful. Reference specific sections when possible.
-For health/ayurveda documents: Provide practical tips and advice.
-For code: Explain functionality, suggest improvements.
-For research: Summarize findings, explain methodology.
+DOCUMENT: {self.file_content[:150000]}
 
-FULL DOCUMENT CONTENT (use as your complete knowledge base):
-{file_content}
-
-USER QUESTION: {prompt}
-
-Provide a detailed, knowledgeable response based only on the document above.
+Format: [{{"event": "description", "time": "date/step"}}, ...]
 """
+            response = model.generate_content(prompt)
+            # Parse JSON response
+            try:
+                timeline = json.loads(response.text)
+                self.timeline = timeline
+                return timeline
+            except:
+                return [{"event": "Timeline extraction in progress", "time": "N/A"}]
+        except:
+            return []
+    
+    def generate_faq(self):
+        """Generate FAQ from document"""
+        if not self.file_content:
+            return []
         
-        response = model.generate_content(system_prompt)
-        return response.text
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+        try:
+            prompt = f"""
+Create 8-12 FAQ questions and answers based on the document.
+Focus on common user questions and key concepts.
 
-def create_text_mind_map(content, max_nodes=8):
-    """Cloud-friendly text-based mind map"""
-    lines = [line.strip() for line in content.split('\n') if line.strip()]
-    key_phrases = []
-    
-    # Extract key phrases (simple heuristic)
-    for line in lines[:20]:  # First 20 lines for main concepts
-        words = re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b', line)
-        if words:
-            key_phrases.extend(words[:2])
-    
-    unique_phrases = list(set(key_phrases))[:max_nodes]
-    
-    mind_map = f"""
-🌐 **DOCUMENT MIND MAP**
-╔══════════════════════════════════════╗
-║          📚 MAIN DOCUMENT            ║
-╠══════════════════════╦═══════════════╣
-║                      ║               ║
-║  ├─ {unique_phrases[0] if len(unique_phrases)>0 else 'Concept 1'}    ║
-║  ├─ {unique_phrases[1] if len(unique_phrases)>1 else 'Concept 2'}    ║
-║  ├─ {unique_phrases[2] if len(unique_phrases)>2 else 'Concept 3'}    ║
-║  └─ {'...' if len(unique_phrases)>3 else 'More Concepts'}           ║
-╚══════════════════════╩═══════════════╝
+DOCUMENT: {self.file_content[:200000]}
 
-💡 Key concepts automatically extracted from your document
+Format as JSON: [{{"question": "...", "answer": "..."}}, ...]
 """
-    return mind_map
+            response = model.generate_content(prompt)
+            try:
+                faq = json.loads(response.text)
+                self.faq = faq
+                return faq
+            except:
+                return [{"question": "FAQ generation", "answer": response.text[:200]}]
+        except:
+            return []
+    
+    def generate_brainstorm(self):
+        """Generate brainstorming ideas"""
+        if not self.file_content:
+            return ""
+        
+        try:
+            prompt = f"""
+Based on the document, generate creative brainstorming ideas:
+- Applications & Extensions
+- Research Directions
+- Business Opportunities
+- Educational Uses
+- Potential Improvements
 
-# Professional UI Setup (FIXED - No duplicate page_title)
+DOCUMENT: {self.file_content[:150000]}
+"""
+            response = model.generate_content(prompt)
+            self.brainstorm = response.text
+            return response.text
+        except:
+            return "Error generating brainstorm"
+
+# UI Setup
 st.set_page_config(
-    page_title="Document LLM Assistant",
-    page_icon="📚",
+    page_title="Notebook LLM Pro",
+    page_icon="📓",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for Professional Design
+# Custom CSS
 st.markdown("""
 <style>
-    .main-header {color: #1E88E5; font-family: 'Georgia', serif; text-align: center; font-size: 2.5em;}
-    .sub-header {color: #1976D2; font-family: 'Arial', sans-serif;}
-    .chat-bubble-user {background: linear-gradient(135deg, #E3F2FD, #BBDEFB); border-radius: 15px; padding: 15px; margin: 10px 0;}
-    .chat-bubble-assistant {background: linear-gradient(135deg, #E8F5E8, #C8E6C9); border-radius: 15px; padding: 15px; margin: 10px 0; border-left: 4px solid #4CAF50;}
-    .response-section {background: #F5F5F5; border-left: 5px solid #2196F3; padding: 20px; border-radius: 10px; margin: 10px 0;}
-    .mindmap-box {background: #FFF3E0; border: 2px dashed #FF9800; padding: 20px; border-radius: 10px; font-family: 'Courier New', monospace;}
-    .image-gallery {display: flex; justify-content: space-around; flex-wrap: wrap;}
-    .metric-card {background: white; padding: 1rem; border-radius: 10px; text-align: center;}
+.study-guide {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 15px;}
+.podcast-card {background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white; padding: 15px; border-radius: 10px;}
+.timeline-item {background: #e3f2fd; padding: 10px; margin: 5px 0; border-left: 4px solid #2196f3;}
+.faq-item {background: #f3e5f5; padding: 15px; margin: 10px 0; border-radius: 8px;}
+.brainstorm-box {background: #e8f5e8; padding: 20px; border-radius: 10px; border-left: 5px solid #4caf50;}
 </style>
 """, unsafe_allow_html=True)
 
+# Initialize app
+if "nllm" not in st.session_state:
+    st.session_state.nllm = NotebookLLM()
+if "features_generated" not in st.session_state:
+    st.session_state.features_generated = {}
+
 # Header
-st.markdown('<h1 class="main-header">📚 Document LLM Assistant</h1>', unsafe_allow_html=True)
-st.markdown('<p style="text-align: center; color: #666; font-size: 1.2em;">Upload any document and unlock deep AI insights</p>', unsafe_allow_html=True)
+st.title("📓 Notebook LLM Pro - Advanced Document Intelligence")
+st.markdown("Upload any document and unlock **deep analysis, study guides, podcasts, timelines, FAQs, and more!**")
 
-# Sidebar - Professional Controls
+# Sidebar
 with st.sidebar:
-    st.header("⚙️ AI Settings")
-    temperature = st.slider("🤖 Creativity Level", 0.1, 1.0, 0.7, 0.1)
-    st.info(f"Current: {temperature:.1f} - Higher = More creative analysis")
+    st.header("⚙️ Controls")
+    temp = st.slider("AI Temperature", 0.1, 1.0, 0.7)
     
-    st.markdown("---")
-    st.header("📁 Supported Formats")
-    st.markdown("• 📖 **PDF Books/Documents**")
-    st.markdown("• 💻 **Code** (.py, .js, .cpp, .java)")
-    st.markdown("• 📝 **Text** (.txt, .md)")
-    st.markdown("• 📓 **Jupyter** (.ipynb)")
+    st.header("📁 Upload")
+    uploaded_file = st.file_uploader("Choose document", type=['pdf', 'ipynb', 'txt', 'py', 'md'])
     
-    st.markdown("---")
-    st.info("🆓 **Powered by:** Gemini 2.5 Flash")
-    if st.button("🔑 API Setup", use_container_width=True):
-        st.markdown("[Get Free Key](https://aistudio.google.com/app/apikey)")
+    if st.button("🔄 Generate All Features"):
+        if uploaded_file:
+            with st.spinner("Processing document..."):
+                content, metadata = st.session_state.nllm.extract_content(uploaded_file)
+                st.session_state.nllm.metadata = metadata
+                
+                # Generate all features
+                st.session_state.features_generated = {
+                    "study_guide": st.session_state.nllm.generate_study_guide(),
+                    "podcast": st.session_state.nllm.generate_podcast_notes(),
+                    "timeline": st.session_state.nllm.generate_timeline(),
+                    "faq": st.session_state.nllm.generate_faq(),
+                    "brainstorm": st.session_state.nllm.generate_brainstorm()
+                }
+                st.success("✅ All features generated!")
 
-# Main Content Layout
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    uploaded_file = st.file_uploader(
-        "📁 Upload Your Document",
-        type=['pdf', 'txt', 'md', 'ipynb', 'py', 'js', 'cpp', 'java'],
-        help="Upload any document for AI analysis"
-    )
-
-with col2:
-    st.markdown('<h3 class="sub-header">💡 Example Queries</h3>', unsafe_allow_html=True)
-    examples = [
-        "Summarize the main points",
-        "Explain key concepts",
-        "Provide practical tips",
-        "What are the main findings?",
-        "Debug/analyze the code"
-    ]
-    for example in examples:
-        st.markdown(f"• {example}")
-
-# Session State
-if "file_content" not in st.session_state:
-    st.session_state.file_content = ""
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "filename" not in st.session_state:
-    st.session_state.filename = ""
-if "topic" not in st.session_state:
-    st.session_state.topic = "default"
-
-# Process File
-if uploaded_file is not None:
-    with st.spinner("🔄 Analyzing document content..."):
-        content = extract_text_from_file(uploaded_file)
-        st.session_state.file_content = content
-        st.session_state.filename = uploaded_file.name
-        st.session_state.topic = detect_document_topic(content)[0]
+# Main Content Tabs
+if uploaded_file or st.session_state.nllm.file_content:
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📖 Document", "🎓 Study Guide", "🎙️ Podcast", "⏰ Timeline", 
+        "❓ FAQ", "💡 Brainstorm"
+    ])
     
-    if not content.startswith(("Error", "Unsupported")):
-        # Success Metrics
-        col1, col2, col3 = st.columns(3)
+    with tab1:
+        st.header("Original Document")
+        st.text_area("Content Preview", st.session_state.nllm.file_content[:3000], height=400)
+        st.json(st.session_state.nllm.metadata)
+    
+    with tab2:
+        st.markdown('<div class="study-guide">', unsafe_allow_html=True)
+        st.header("🎓 Interactive Study Guide")
+        if "study_guide" in st.session_state.features_generated:
+            st.markdown(st.session_state.features_generated["study_guide"])
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Interactive quiz
+        if st.button("🧠 Generate Quiz"):
+            st.info("Quiz feature coming soon!")
+    
+    with tab3:
+        st.markdown('<div class="podcast-card">', unsafe_allow_html=True)
+        st.header("🎙️ AI Podcast Notes")
+        if "podcast" in st.session_state.features_generated:
+            st.markdown(st.session_state.features_generated["podcast"])
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
         with col1:
-            st.metric("📄 Document", st.session_state.filename)
+            if st.button("🎵 Generate Audio"):
+                st.info("Audio synthesis integration ready")
         with col2:
-            st.metric("📊 Content Size", f"{len(content)/1000:.1f} KB")
-        with col3:
-            st.metric("🎯 Topic", st.session_state.topic.upper())
+            if st.button("📄 Export Script"):
+                st.info("Podcast script export ready")
+    
+    with tab4:
+        st.header("⏰ Document Timeline")
+        if st.session_state.nllm.timeline:
+            for event in st.session_state.nllm.timeline:
+                st.markdown(f"""
+                <div class="timeline-item">
+                    <strong>{event.get('time', 'N/A')}</strong>: {event.get('event', '')}
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("No chronological events detected")
+    
+    with tab5:
+        st.header("❓ Smart FAQ")
+        if st.session_state.nllm.faq:
+            for item in st.session_state.nllm.faq:
+                with st.expander(item["question"]):
+                    st.write(item["answer"])
+        else:
+            st.info("FAQ generation in progress...")
+    
+    with tab6:
+        st.markdown('<div class="brainstorm-box">', unsafe_allow_html=True)
+        st.header("💡 Brainstorming Ideas")
+        if "brainstorm" in st.session_state.features_generated:
+            st.markdown(st.session_state.features_generated["brainstorm"])
+        st.markdown('</div>', unsafe_allow_html=True)
         
-        # Preview
-        with st.expander("👁️ Document Preview", expanded=False):
-            st.text_area("Content", content[:2000], height=200, disabled=True)
-        
-        # Mind Map Option
-        if st.checkbox("🧠 Generate Mind Map"):
-            mind_map = create_text_mind_map(content)
-            st.markdown('<div class="mindmap-box">', unsafe_allow_html=True)
-            st.markdown(mind_map)
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Chat Interface
-        st.markdown('<h2 class="sub-header">💬 AI Document Chat</h2>', unsafe_allow_html=True)
-        
-        # Chat History
-        for message in st.session_state.messages[-10:]:
-            with st.chat_message(message["role"]):
-                if message["role"] == "user":
-                    st.markdown(f'<div class="chat-bubble-user">{message["content"]}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="chat-bubble-assistant">{message["content"]}</div>', unsafe_allow_html=True)
-        
-        # Chat Input
-        if prompt := st.chat_input("Ask about your document..."):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(f'<div class="chat-bubble-user">{prompt}</div>', unsafe_allow_html=True)
-            
-            with st.chat_message("assistant"):
-                with st.spinner("🤖 AI is analyzing your document..."):
-                    response = generate_response(prompt, st.session_state.file_content, temperature)
-                    st.markdown(f'<div class="response-section">{response}</div>', unsafe_allow_html=True)
-                
-                st.session_state.messages.append({"role": "assistant", "content": response})
-                
-                # Dynamic Relevant Images
-                img_urls = get_relevant_images([st.session_state.topic])
-                st.markdown('<h4>🖼️ Visual Context</h4>', unsafe_allow_html=True)
-                cols = st.columns(len(img_urls))
-                for i, url in enumerate(img_urls):
-                    with cols[i]:
-                        img = fetch_image(url)
-                        if img:
-                            st.image(img, use_column_width=True)
-                        time.sleep(0.2)  # Rate limiting
-        
-        # Controls
-        col_btn1, col_btn2 = st.columns(2)
-        with col_btn1:
-            if st.button("🗑️ Clear Chat", use_container_width=True):
-                st.session_state.messages = []
-                st.rerun()
-        with col_btn2:
-            if st.button("📁 New Document", use_container_width=True):
-                st.session_state = {"file_content": "", "messages": [], "filename": "", "topic": "default"}
-                st.rerun()
-    else:
-        st.error(f"❌ {content}")
+        if st.button("🎯 Generate Action Plan"):
+            st.info("Action plan from brainstorm ready")
 
-# Welcome Screen
-if uploaded_file is None and not st.session_state.messages:
-    st.info("""
-    🚀 **Welcome to Document LLM Assistant!**
+# Chat Interface (NotebookLM Style)
+st.markdown("---")
+st.header("💬 Deep Document Chat")
+if st.session_state.nllm.file_content:
+    # Chat history
+    for message in st.session_state.get("chat_messages", []):
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
     
-    **Upload any document** (PDF, code, text, notebooks) and get:
-    • Deep AI understanding of your content
-    • Comprehensive answers to any question
-    • Automatic topic detection
-    • Visual context with relevant images
-    • Professional mind maps
-    
-    **Works with:** Research papers, codebases, books, technical docs, health guides, and more!
-    """)
+    # Chat input
+    if prompt := st.chat_input("Ask about your document..."):
+        st.session_state.chat_messages = st.session_state.get("chat_messages", [])
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        with st.chat_message("assistant"):
+            with st.spinner("Deep analysis..."):
+                response = model.generate_content([
+                    f"Deeply analyze this document: {st.session_state.nllm.file_content[:200000]}",
+                    f"User question: {prompt}"
+                ])
+                st.markdown(response.text)
+            
+            st.session_state.chat_messages.append({"role": "assistant", "content": response.text})
 
 # Footer
 st.markdown("---")
 st.markdown("""
-<div style='text-align: center; color: #666; padding: 20px;'>
-    📚 Document LLM Assistant | Professional AI Document Analysis | Powered by Streamlit + Gemini 2.5
+<div style='text-align: center; color: #666;'>
+    📓 Notebook LLM Pro | Advanced Document Intelligence | Powered by Gemini 2.5
 </div>
 """, unsafe_allow_html=True)

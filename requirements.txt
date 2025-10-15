@@ -5,3 +5,4 @@ nbformat>=5.7.0
 PyPDF2>=3.0.0
 requests>=2.31.0
 Pillow>=10.0.0
+numpy>=1.24.0
