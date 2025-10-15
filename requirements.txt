@@ -6,4 +6,3 @@ PyPDF2>=3.0.0
 pandas>=2.0.0
 pydot>=1.4.2
 graphviz
-python3-pydot
