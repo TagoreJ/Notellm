@@ -6,9 +6,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import numpy as np
 import time
 import re
-import os
 
-# Load models once
+# Load local models once
 @st.cache_resource(show_spinner=False)
 def load_local_llm():
     tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
@@ -23,11 +22,9 @@ def extract_pdf_text_chunks(pdf_file, chunk_size=300, chunk_overlap=50):
     reader = PdfReader(pdf_file)
     full_text = ""
     for page in reader.pages[:10]:
-        page_text = page.extract_text()
-        if page_text:
-            full_text += page_text + " "
-
-    # split into chunks by sentences with overlap
+        text = page.extract_text()
+        if text:
+            full_text += text + " "
     sentences = re.split(r'(?<=[.?!])\s+', full_text)
     chunks = []
     current_chunk = ""
@@ -39,8 +36,6 @@ def extract_pdf_text_chunks(pdf_file, chunk_size=300, chunk_overlap=50):
             current_chunk = sentence
     if current_chunk:
         chunks.append(current_chunk.strip())
-
-    # add overlap by repeating last sentences of previous chunk
     overlapped_chunks = []
     for i, chunk in enumerate(chunks):
         if i == 0:
@@ -61,41 +56,32 @@ def retrieve_chunks(query_embedding, index, k=3):
     return I[0]
 
 def filter_redundant_sentences(text):
-    # Remove repeated consecutive sentences
     sentences = re.split(r'(?<=[.?!])\s+', text)
     filtered = []
     seen = set()
     for sent in sentences:
-        if sent.strip() not in seen:
+        sent = sent.strip()
+        if sent and sent not in seen:
             filtered.append(sent)
-            seen.add(sent.strip())
+            seen.add(sent)
     return ' '.join(filtered)
 
 def build_prompt(context_chunks, query):
     context_text = "\n\n".join(context_chunks)
-    return (f"You are a helpful financial academic assistant. "
-            f"Answer the question concisely based ONLY on the context below. "
-            f"Avoid repetition.\n\nCONTEXT:\n{context_text}\n\nQUESTION:\n{query}\n\nAnswer:")
+    return (f"You are a helpful academic assistant. "
+            f"Answer concisely based ONLY on the context below. Avoid repetition.\n\nCONTEXT:\n{context_text}\n\nQUESTION:\n{query}\n\nAnswer:")
 
 def generate_local_llm_answer(prompt, generator):
-    progress_bar = st.progress(0)
+    progress_bar = st.progress(0, text="Generating answer locally...")
     for i in range(5):
         time.sleep(0.3)
         progress_bar.progress((i+1)*20)
     output = generator(prompt, max_length=200, do_sample=True)[0]["generated_text"]
-    progress_bar.progress(100)
+    progress_bar.progress(100, text="Generation complete")
     return filter_redundant_sentences(output)
 
-# Optional Gemini API fallback for longer queries
-def generate_gemini_response(prompt, gemini_model):
-    try:
-        response = gemini_model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Gemini API error: {e}"
-
-# Streamlit UI
-st.title("📄 PDF + DistilGPT2 'Smart' RAG Demo with Hybrid Option")
+# === Streamlit app starts ===
+st.title("📄 Local PDF QA with DistilGPT2 & FAISS RAG")
 
 uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
 
@@ -103,13 +89,13 @@ local_generator = load_local_llm()
 embed_model = load_embedding_model()
 
 if uploaded_file:
-    with st.spinner("Extracting and indexing..."):
+    with st.spinner("Extracting PDF text and building index..."):
         chunks = extract_pdf_text_chunks(uploaded_file)
         chunk_embeddings = embed_model.encode(chunks)
         index = build_faiss_index(np.array(chunk_embeddings))
-    st.success(f"Extracted {len(chunks)} chunks")
+    st.success(f"Extracted and indexed {len(chunks)} chunks")
 
-    query = st.text_input("Ask a question:")
+    query = st.text_input("Ask a question about your PDF:")
 
     if query:
         start_time = time.time()
@@ -117,21 +103,12 @@ if uploaded_file:
         top_indices = retrieve_chunks(query_embedding, index)
         retrieved_chunks = [chunks[i] for i in top_indices]
 
-        st.markdown("### Retrieved Source Snippets:")
+        st.markdown("### Retrieved Snippets from Document:")
         for i, snippet in enumerate(retrieved_chunks, 1):
             st.markdown(f"**Snippet {i}:** {snippet[:400]}...")
 
         prompt = build_prompt(retrieved_chunks, query)
-
-        # Choose hybrid mode toggle
-        use_gemini = st.checkbox("Use Gemini API fallback for richer answers", value=False)
-        answer = ""
-
-        if use_gemini:
-            st.warning("Gemini API not integrated in this snippet - implement your API client here.")
-            answer = "Gemini API answer placeholder"
-        else:
-            answer = generate_local_llm_answer(prompt, local_generator)
+        answer = generate_local_llm_answer(prompt, local_generator)
 
         st.markdown("### Answer:")
         st.write(answer)
@@ -140,4 +117,7 @@ if uploaded_file:
         st.caption(f"⏰ Answer generated in {elapsed:.2f} seconds")
 
 else:
-    st.info("Upload a PDF to ask questions with this smart DistilGPT2 local RAG interface.")
+    st.info("Upload a PDF file to start question-answering locally.")
+
+st.markdown("---")
+st.caption("Fully offline local RAG with small DistilGPT2 | Updated Oct 2025")
