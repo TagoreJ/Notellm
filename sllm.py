@@ -1,8 +1,12 @@
 import streamlit as st
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
+import faiss
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import numpy as np
 import time
 
-# Load tokenizer and model once, cache it
+# Load small local GPT2 model just once and cache it
 @st.cache_resource(show_spinner=False)
 def load_local_llm():
     tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
@@ -10,56 +14,92 @@ def load_local_llm():
     generator = pipeline('text-generation', model=model, tokenizer=tokenizer)
     return generator
 
-generator = load_local_llm()
+# Load SBERT embedding model once and cache it
+@st.cache_resource(show_spinner=False)
+def load_embedding_model():
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
-st.set_page_config(page_title="Notebook LLM with Local DistilGPT2", layout="wide")
+# Extract text chunks from PDF pages
+def extract_pdf_text_chunks(pdf_file, chunk_size=500, chunk_overlap=50):
+    reader = PdfReader(pdf_file)
+    text = ""
+    for page in reader.pages[:10]:  # limit pages
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
+    # Split text into overlapping chunks
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - chunk_overlap
+    return chunks
 
-st.title("📓 Notebook LLM with Local LLM Mode")
+# Build FAISS index (simple L2) for chunks embeddings
+def build_faiss_index(embeddings):
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+    return index
 
-# Sidebar model selection
-mode = st.sidebar.selectbox("Select Model Mode", ["Gemini Cloud API", "Local DistilGPT2"])
+# Retrieve top k relevant chunks for a query embedding
+def retrieve_chunks(query_embedding, index, k=3):
+    D, I = index.search(np.array([query_embedding]), k)
+    return I[0]
 
-if mode == "Local DistilGPT2":
-    st.info("Running small local DistilGPT2 model inference in this session (no API key needed).")
+# Format prompt for DistilGPT2 with retrieved context + query
+def build_prompt(context_chunks, query):
+    context_text = "\n".join(context_chunks)
+    prompt = (f"Answer the question based ONLY on the context below.\n\n"
+              f"CONTEXT:\n{context_text}\n\n"
+              f"QUESTION: {query}\n\nAnswer:")
+    return prompt
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+# Generate answer using local DistilGPT2
+def generate_answer(prompt, generator):
+    # Simulate progress bar
+    progress_bar = st.progress(0)
+    for i in range(5):
+        time.sleep(0.3)
+        progress_bar.progress((i+1)*20)
+    outputs = generator(prompt, max_length=200, do_sample=True)
+    progress_bar.progress(100)
+    return outputs[0]['generated_text']
 
-    st.subheader("Chat with Local DistilGPT2")
+# Streamlit App starts here
 
-    # Display chat history
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+st.title("📄 PDF + Local DistilGPT2 RAG Demo")
 
-    # Chat input
-    if prompt := st.chat_input("Enter your question for Local LLM..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+uploaded_file = st.file_uploader("Upload PDF", type=["pdf"], help="Upload PDF to query with local DistilGPT2")
 
-        with st.chat_message("assistant"):
-            progress_bar = st.progress(0)
-            start_time = time.time()
+if uploaded_file is not None:
+    with st.spinner("Extracting text and building index..."):
+        text_chunks = extract_pdf_text_chunks(uploaded_file)
+        embed_model = load_embedding_model()
+        chunk_embeddings = embed_model.encode(text_chunks)
+        faiss_index = build_faiss_index(np.array(chunk_embeddings))
 
-            # Simulate progress in steps
-            output_text = ""
-            for i in range(1, 6):
-                time.sleep(0.3)  # simulate chunk generation delay
-                progress_bar.progress(i * 20)
+        st.success(f"Extracted {len(text_chunks)} chunks and built FAISS index")
 
-            # Actual generation call (can be slow on CPU)
-            outputs = generator(prompt, max_length=100, do_sample=True)
-            output_text = outputs[0]['generated_text']
+    generator = load_local_llm()
 
-            elapsed = time.time() - start_time
-            progress_bar.progress(100)  # complete progress bar
+    query = st.text_input("Ask a question about your PDF:")
 
-            st.markdown(output_text)
-            st.caption(f"⏳ Generated in {elapsed:.2f} seconds")
+    if query:
+        start = time.time()
+        query_emb = embed_model.encode(query)
+        top_indices = retrieve_chunks(query_emb, faiss_index, k=3)
+        retrieved_chunks = [text_chunks[i] for i in top_indices]
 
-            st.session_state.messages.append({"role": "assistant", "content": output_text})
+        prompt = build_prompt(retrieved_chunks, query)
 
-else:
-    st.warning("Gemini API mode not implemented here. Use your existing integration.")
+        with st.spinner("Generating answer with DistilGPT2..."):
+            answer = generate_answer(prompt, generator)
 
+        elapsed = time.time() - start
+
+        st.markdown("**Answer:**")
+        st.write(answer)
+
+        st.caption(f"⏰ Answer generated in {elapsed:.2f} seconds")
