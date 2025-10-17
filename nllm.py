@@ -1,409 +1,256 @@
-import streamlit as st
+\import streamlit as st
 import google.generativeai as genai
 import nbformat
 from PyPDF2 import PdfReader
 import os
 import tempfile
 import json
-import requests
-from io import BytesIO
 from dotenv import load_dotenv
-from PIL import Image
-import io
-import time
-import re
-from datetime import datetime
-import numpy as np
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-    print("sklearn not available, using simple search")
+from pathlib import Path
 
-try:
-    import gtts
-    GTTS_AVAILABLE = True
-except ImportError:
-    GTTS_AVAILABLE = False
-
+# Load environment variables
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
+# Configuration
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+# API Key validation
 if not API_KEY:
-    st.error("GEMINI_API_KEY required in secrets or .env")
+    st.error("❌ **GEMINI_API_KEY not found!**")
+    st.markdown("""
+    ### Create `.env` file in the same directory:
+    ```
+    GEMINI_API_KEY=your_actual_api_key_here
+    ```
+    Get your FREE key: [Google AI Studio](https://aistudio.google.com/app/apikey)
+    """)
     st.stop()
 
+# Initialize Gemini with updated model for 2025 - free tier compatible
 try:
     genai.configure(api_key=API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    st.session_state.model_ready = True
-except:
-    st.session_state.model_ready = False
-    st.error("Model connection failed")
+    model = genai.GenerativeModel('gemini-2.0-flash-exp')
+    st.sidebar.success("✅ Gemini 2.0 Connected!")
+except Exception as e:
+    st.error(f"❌ Gemini API Error: {str(e)}")
+    st.info("💡 Try updating your SDK: pip install --upgrade google-generativeai")
+    st.stop()
 
-class NotebookLM:
-    def __init__(self):
-        self.content = ""
-        self.chunks = []
-        self.metadata = {}
-        self.sources = []
-        self.guide = ""
-        self.audio = None
-        
-    def safe_extract_text(self, uploaded_file):
-        """Safe text extraction with progress"""
-        file_name = uploaded_file.name.lower()
-        content = ""
-        
-        file_bytes = uploaded_file.read()
-        uploaded_file.seek(0)
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-        
-        try:
-            status_text = st.empty()
-            status_text.text(f"Processing {file_name}...")
-            
-            if file_name.endswith('.ipynb'):
-                content = self._extract_notebook(tmp_path)
-            elif file_name.endswith('.pdf'):
-                content = self._extract_pdf(tmp_path)
-            else:
-                content = self._extract_text(tmp_path)
-                
-            self.content = content[:100000]  # Limit size
-            self.metadata = {"filename": uploaded_file.name, "type": file_name.split('.')[-1]}
-            
-            status_text.text("✓ Content extracted successfully")
-            return True
-            
-        except Exception as e:
-            st.error(f"Extraction failed: {str(e)}")
-            return False
-        finally:
+def extract_notebook_content(nb):
+    """Extract content from Jupyter notebook"""
+    content = "# 📓 JUPYTER NOTEBOOK\n\n"
+    try:
+        for i, cell in enumerate(nb.cells, 1):
+            if cell.cell_type == 'markdown':
+                content += f"## Markdown Cell {i}\n{cell.source}\n\n"
+            elif cell.cell_type == 'code':
+                content += f"## Code Cell {i}\n``````\n\n"
+                if cell.get('outputs'):
+                    outputs = json.dumps(cell.outputs, indent=2)[:1000]
+                    content += f"### Outputs:\n{outputs}\n\n"
+        return content
+    except Exception as e:
+        return f"Error parsing notebook: {str(e)}"
+
+def extract_text_content(file_path, file_name):
+    """Extract text from text files"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return f"# 📄 {Path(file_name).stem.upper()}\n\n{content}"
+    except:
+        return "Error reading text file"
+
+def extract_pdf_content(file_path):
+    """Extract content from PDF"""
+    try:
+        reader = PdfReader(file_path)
+        content = "# 📄 PDF DOCUMENT\n\n"
+        for i, page in enumerate(reader.pages[:10], 1):  # Limit pages
             try:
-                os.unlink(tmp_path)
+                text = page.extract_text()
+                if text and text.strip():
+                    content += f"## Page {i}\n{text[:2000]}\n\n"
             except:
-                pass
-    
-    def _extract_notebook(self, path):
-        try:
-            nb = nbformat.read(path, as_version=4)
-            content = "NOTEBOOK:\n"
-            for cell in nb.cells[:20]:
-                if cell.cell_type == 'code':
-                    content += f"CODE:\n{cell.source[:2000]}\n\n"
-                else:
-                    content += f"MARKDOWN:\n{cell.source[:1000]}\n\n"
-            return content
-        except:
-            return "Notebook content unavailable"
-    
-    def _extract_pdf(self, path):
-        try:
-            reader = PdfReader(path)
-            content = "PDF DOCUMENT:\n"
-            for i, page in enumerate(reader.pages[:25]):
-                try:
-                    text = page.extract_text()
-                    if text.strip():
-                        content += f"PAGE {i+1}:\n{text[:1500]}\n\n"
-                except:
-                    continue
-            return content
-        except:
-            return "PDF content unavailable"
-    
-    def _extract_text(self, path):
-        try:
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                return f.read()
-        except:
-            return "Text content unavailable"
-    
-    def simple_search(self, query):
-        """Simple keyword search when sklearn unavailable"""
-        if not self.chunks:
-            self.chunks = [self.content[i:i+2000] for i in range(0, len(self.content), 2000)]
-        
-        query_words = set(query.lower().split())
-        best_match = max(self.chunks, key=lambda chunk: len(query_words.intersection(set(chunk.lower().split()))))
-        return [best_match]
-    
-    def rag_search(self, query):
-        """RAG search with fallback"""
-        if SKLEARN_AVAILABLE and len(self.chunks) > 1:
-            try:
-                vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
-                X = vectorizer.fit_transform(self.chunks)
-                query_vec = vectorizer.transform([query])
-                similarities = cosine_similarity(query_vec, X).flatten()
-                top_idx = np.argmax(similarities)
-                return [self.chunks[top_idx]]
-            except:
-                pass
-        
-        # Fallback to simple search
-        return self.simple_search(query)
-    
-    def generate_response(self, query):
-        """Generate focused response"""
-        try:
-            context = '\n'.join(self.rag_search(query))
-            
-            prompt = f"""
-            Using only this document context, answer concisely:
-            
-            CONTEXT: {context[:4000]}
-            
-            QUESTION: {query}
-            
-            Give direct, relevant answer only.
-            """
-            
-            response = model.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            return f"Response error: {str(e)}"
-    
-    def generate_guide(self):
-        """Generate study guide"""
-        try:
-            prompt = f"""
-            Create concise study guide for:
-            {self.content[:20000]}
-            
-            Include:
-            - Key concepts
-            - Main points
-            - Important terms
-            
-            Keep brief and structured.
-            """
-            response = model.generate_content(prompt)
-            self.guide = response.text
-            return self.guide
-        except:
-            return "Guide generation failed"
-    
-    def generate_audio(self, text):
-        """Generate audio with fallback"""
-        if not GTTS_AVAILABLE:
-            return None
-        try:
-            tts = gtts.gTTS(text[:300], lang='en')
-            audio_bytes = io.BytesIO()
-            tts.write_to_fp(audio_bytes)
-            audio_bytes.seek(0)
-            return audio_bytes.getvalue()
-        except:
-            return None
+                continue
+        return content if content != "# 📄 PDF DOCUMENT\n\n" else "No text extracted from PDF"
+    except Exception as e:
+        return f"Error parsing PDF: {str(e)}"
 
-# Custom CSS to match NotebookLM
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&display=swap');
-    
-.main {
-    font-family: 'Google Sans', sans-serif;
-}
+@st.cache_data
+def process_uploaded_file(uploaded_file):
+    """Process uploaded file and extract content"""
+    file_name = uploaded_file.name.lower()
+    file_content = uploaded_file.read()
+    uploaded_file.seek(0)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_name).suffix) as tmp:
+        tmp.write(file_content)
+        tmp_path = tmp.name
+    try:
+        if file_name.endswith('.ipynb'):
+            nb = nbformat.read(tmp_path, as_version=4)
+            return extract_notebook_content(nb)
+        elif file_name.endswith(('.txt', '.py', '.md', '.r', '.js', '.cpp', '.java', '.json')):
+            return extract_text_content(tmp_path, file_name)
+        elif file_name.endswith('.pdf'):
+            return extract_pdf_content(tmp_path)
+        else:
+            return f"Unsupported file: {file_name}"
+    finally:
+        os.unlink(tmp_path)
 
-.stApp {
-    background-color: #fafafa;
-}
+def generate_ai_response(prompt, context):
+    """Generate response using Gemini with file context"""
+    try:
+        system_prompt = f"""
+You are an expert document analysis assistant. Answer questions based ONLY on the provided context.
+Be specific, reference code sections, explain concepts clearly, and provide helpful insights.
 
-.header-section {
-    background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%);
-    color: white;
-    padding: 2rem;
-    border-radius: 16px;
-    margin-bottom: 2rem;
-    text-align: center;
-}
+CONTEXT FROM UPLOADED FILE:
+{context}
 
-.upload-area {
-    background: white;
-    padding: 2rem;
-    border-radius: 12px;
-    border: 2px dashed #e5e7eb;
-    text-align: center;
-    margin: 1rem 0;
-}
+USER QUESTION: {prompt}
 
-.source-card {
-    background: white;
-    border-radius: 12px;
-    padding: 1.5rem;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-    margin: 1rem 0;
-}
+Respond helpfully and accurately using only the context above.
+"""
+        response = model.generate_content(system_prompt)
+        return response.text
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
 
-.chat-bubble {
-    background: white;
-    border-radius: 18px;
-    padding: 1rem 1.5rem;
-    margin: 0.5rem 0;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-}
+# Streamlit UI
+st.set_page_config(
+    page_title="Notebook LLM",
+    page_icon="📓",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-.notebooklm-blue {
-    color: #1e40af;
-}
+st.title("📓 Notebook LLM - AI Document Assistant")
+st.markdown("Upload files and chat about their content using Google Gemini 2.0!")
 
-.guide-section {
-    background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-    border-left: 4px solid #3b82f6;
-    padding: 1.5rem;
-    border-radius: 8px;
-}
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    st.subheader("Supported Formats")
+    st.markdown("""
+    - 📓 Jupyter `.ipynb`
+    - 💻 Code `.py`, `.js`, `.cpp`, `.java`, `.R`, `.json`
+    - 📝 Text `.txt`, `.md`
+    - 📄 PDF `.pdf`
+    """)
+    st.markdown("---")
+    st.info("🆓 Free Tier: 15-60 RPM, 1M tokens")
+    if st.button("🔑 Get API Key"):
+        st.markdown("[Google AI Studio](https://aistudio.google.com/app/apikey)")
+    st.markdown("---")
+    if st.button("ℹ️ Tips"):
+        st.markdown("""
+        **Great prompts:**
+        - "Summarize this notebook"
+        - "Explain the main algorithm"
+        - "What libraries are used?"
+        - "Debug this code"
+        - "Generate similar examples"
+        """)
 
-.stTabs [data-baseweb="tab-list"] {
-    gap: 0.5rem;
-}
-
-.stTabs [data-baseweb="tab"] {
-    border-radius: 8px 8px 0 0;
-    padding: 0.75rem 1.5rem;
-}
-
-.sidebar .sidebar-content {
-    background: #f8fafc;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# Initialize session
-if "notebook" not in st.session_state:
-    st.session_state.notebook = NotebookLM()
-if "sources" not in st.session_state:
-    st.session_state.sources = []
-if "chat" not in st.session_state:
-    st.session_state.chat = []
-
-# Header - NotebookLM Style
-st.markdown("""
-<div class="header-section">
-    <h1 style="margin: 0; font-weight: 700;">NotebookLM</h1>
-    <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">Your notebook. Your AI assistant.</p>
-</div>
-""", unsafe_allow_html=True)
-
-# Main content area
-col1, col2 = st.columns([2, 1])
+# Main content
+col1, col2 = st.columns([3, 1])
 
 with col1:
-    # Upload section
-    st.markdown('<div class="upload-area">', unsafe_allow_html=True)
+    # File uploader
     uploaded_file = st.file_uploader(
-        "Upload your first source", 
-        type=['pdf', 'ipynb', 'txt', 'md', 'py'],
-        help="Supports PDFs, notebooks, and text files"
+        "📁 Upload Document",
+        type=['ipynb', 'py', 'txt', 'md', 'r', 'js', 'cpp', 'java', 'json', 'pdf'],
+        help="Choose a file to analyze"
     )
-    
-    if uploaded_file is not None and st.button("Add Source", key="add_source"):
-        with st.spinner("Processing document..."):
-            if st.session_state.notebook.safe_extract_text(uploaded_file):
-                st.session_state.sources.append({
-                    "name": uploaded_file.name,
-                    "added": datetime.now().strftime("%H:%M")
-                })
-                st.success(f"✓ {uploaded_file.name} added")
-                st.rerun()
-    
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Sources list
-    if st.session_state.sources:
-        st.subheader("Sources")
-        for i, source in enumerate(st.session_state.sources):
-            st.markdown(f"""
-            <div class="source-card">
-                <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <div>
-                        <strong>{source['name']}</strong><br>
-                        <small style="color: #6b7280;">Added {source['added']}</small>
-                    </div>
-                    <button style="background: #ef4444; color: white; border: none; border-radius: 6px; padding: 0.25rem 0.5rem; cursor: pointer;" onclick="this.parentElement.parentElement.remove()">×</button>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
 
 with col2:
-    st.markdown("""
-    <div style="background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-        <h3 style="color: #1e40af; margin-top: 0;">What can I help with?</h3>
-        <ul style="color: #6b7280; line-height: 1.6;">
-            <li>Summarize key points</li>
-            <li>Explain concepts</li>
-            <li>Create study guides</li>
-            <li>Answer questions</li>
-            <li>Generate audio overviews</li>
-        </ul>
-    </div>
-    """, unsafe_allow_html=True)
+    st.info("💡 Example Questions:")
+    examples = [
+        "Summarize this document",
+        "Explain the main function",
+        "What does this code do?",
+        "Find bugs or issues"
+    ]
+    for example in examples:
+        st.write(f"• {example}")
 
-# Main tabs
-if st.session_state.sources:
-    tab1, tab2, tab3 = st.tabs(["Notebook", "Chat", "Guide"])
-    
-    with tab1:
-        st.markdown('<div class="guide-section">', unsafe_allow_html=True)
-        st.subheader("Notebook Guide")
-        
-        if st.button("Generate Guide", key="gen_guide"):
-            with st.spinner("Creating guide..."):
-                guide = st.session_state.notebook.generate_guide()
-                st.markdown(f"### Key Concepts\n{guide}")
-        
-        # Audio generation
-        if st.button("Generate Audio Overview", key="gen_audio"):
-            with st.spinner("Creating audio..."):
-                audio = st.session_state.notebook.generate_audio(st.session_state.notebook.guide or st.session_state.notebook.content[:500])
-                if audio:
-                    st.audio(audio)
-                else:
-                    st.warning("Audio generation unavailable")
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    with tab2:
-        st.subheader("Ask questions about your sources")
-        
+# Session state initialization
+if "file_content" not in st.session_state:
+    st.session_state.file_content = ""
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "filename" not in st.session_state:
+    st.session_state.filename = ""
+
+# File processing
+if uploaded_file is not None:
+    with st.spinner("🔄 Processing file..."):
+        content = process_uploaded_file(uploaded_file)
+        st.session_state.file_content = content
+        st.session_state.filename = uploaded_file.name
+
+    if not content.startswith(("Error", "Unsupported")):
+        st.success(f"✅ Loaded: **{st.session_state.filename}**")
+
+        # File preview
+        with st.expander("📋 Document Preview", expanded=False):
+            st.text_area(
+                "Content",
+                st.session_state.file_content[:4000],
+                height=300,
+                disabled=True
+            )
+
         # Chat interface
-        for message in st.session_state.chat[-10:]:
-            with st.chat_message(message["role"]):
-                st.markdown(f'<div class="chat-bubble">{message["content"]}</div>', unsafe_allow_html=True)
-        
-        if prompt := st.chat_input("Ask a question..."):
-            st.session_state.chat.append({"role": "user", "content": prompt})
+        st.subheader("💬 Ask Questions About Your File")
+
+        # Chat history
+        for msg in st.session_state.messages[-8:]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # Chat input
+        if prompt := st.chat_input("Ask about your document..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
-                st.markdown(f'<div class="chat-bubble">{prompt}</div>', unsafe_allow_html=True)
-            
+                st.markdown(prompt)
+
             with st.chat_message("assistant"):
-                with st.spinner("NotebookLM is thinking..."):
-                    response = st.session_state.notebook.generate_response(prompt)
-                    st.markdown(f'<div class="chat-bubble">{response}</div>', unsafe_allow_html=True)
-                
-                st.session_state.chat.append({"role": "assistant", "content": response})
-    
-    with tab3:
-        st.subheader("Source Details")
-        st.text_area("Content Preview", st.session_state.notebook.content[:2000], height=300, disabled=True)
+                with st.spinner("🤔 Analyzing..."):
+                    response = generate_ai_response(prompt, st.session_state.file_content)
+                    st.markdown(response)
+
+                st.session_state.messages.append({"role": "assistant", "content": response})
+
+        # Controls
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("🗑️ Clear Chat"):
+                st.session_state.messages = []
+                st.experimental_rerun()
+        with col_btn2:
+            if st.button("🔄 Reprocess File"):
+                st.session_state.file_content = ""
+                st.experimental_rerun()
+    else:
+        st.error(f"❌ {content}")
+
+# Welcome message
+if not st.session_state.file_content or uploaded_file is None:
+    st.info("""
+    🚀 Get Started:
+    1. Upload a Jupyter notebook, code file, PDF, or text document
+    2. Wait for content extraction
+    3. Ask questions in the chat below
+    4. Get AI-powered analysis!
+    """)
 
 # Footer
-st.markdown("""
-<div style="text-align: center; padding: 2rem; color: #6b7280; border-top: 1px solid #e5e7eb; margin-top: 2rem;">
-    <p>Powered by Google Gemini • Your personal AI research assistant</p>
-</div>
-""", unsafe_allow_html=True)
-
-# Clear session
-if st.sidebar.button("Clear All Sources"):
-    st.session_state.sources = []
-    st.session_state.chat = []
-    st.session_state.notebook = NotebookLM()
-    st.rerun()
+st.markdown("---")
+st.markdown(
+    """
+    📓 Notebook LLM | Powered by Streamlit + Google Gemini 2.0
+    Updated for October 2025 | Free tier compatible 
+    """, unsafe_allow_html=True)
