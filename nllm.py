@@ -5,20 +5,20 @@ from PyPDF2 import PdfReader
 import os
 import tempfile
 import json
+import time
 from dotenv import load_dotenv
 from pathlib import Path
 
 # Load environment variables
 load_dotenv()
 
-# Configuration
 API_KEY = os.getenv("GEMINI_API_KEY")
 
-# API Key validation
+# Validate API key
 if not API_KEY:
     st.error("❌ **GEMINI_API_KEY not found!**")
     st.markdown("""
-    ### Create `.env` file in the same directory:
+    ### Create `.env` file:
     ```
     GEMINI_API_KEY=your_actual_api_key_here
     ```
@@ -26,231 +26,160 @@ if not API_KEY:
     """)
     st.stop()
 
-# Initialize Gemini with updated model for 2025 - free tier compatible
+# Initialize Gemini (using flash‑lite for higher limits)
 try:
     genai.configure(api_key=API_KEY)
-    model = genai.GenerativeModel('gemini-2.0-flash-exp')
-    st.sidebar.success("✅ Gemini 2.0 Connected!")
+    model = genai.GenerativeModel("gemini-2.0-flash-lite")
+    st.sidebar.success("✅ Gemini 2.0 Flash‑Lite Connected!")
 except Exception as e:
-    st.error(f"❌ Gemini API Error: {str(e)}")
-    st.info("💡 Try updating your SDK: pip install --upgrade google-generativeai")
+    st.error(f"❌ Gemini API Error: {e}")
+    st.info("💡 Try: pip install --upgrade google-generativeai")
     st.stop()
 
+# ---------------- File Extraction ----------------
 def extract_notebook_content(nb):
-    """Extract content from Jupyter notebook"""
+    """Extracts readable notebook content"""
     content = "# 📓 JUPYTER NOTEBOOK\n\n"
     try:
         for i, cell in enumerate(nb.cells, 1):
-            if cell.cell_type == 'markdown':
+            if cell.cell_type == "markdown":
                 content += f"## Markdown Cell {i}\n{cell.source}\n\n"
-            elif cell.cell_type == 'code':
+            elif cell.cell_type == "code":
                 content += f"## Code Cell {i}\n``````\n\n"
-                if cell.get('outputs'):
+                if cell.get("outputs"):
                     outputs = json.dumps(cell.outputs, indent=2)[:1000]
                     content += f"### Outputs:\n{outputs}\n\n"
-        return content
     except Exception as e:
-        return f"Error parsing notebook: {str(e)}"
+        content += f"\nError parsing notebook: {e}"
+    return content
 
 def extract_text_content(file_path, file_name):
-    """Extract text from text files"""
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        return f"# 📄 {Path(file_name).stem.upper()}\n\n{content}"
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f"# 📄 {Path(file_name).stem.upper()}\n\n{f.read()}"
     except:
         return "Error reading text file"
 
 def extract_pdf_content(file_path):
-    """Extract content from PDF"""
     try:
         reader = PdfReader(file_path)
-        content = "# 📄 PDF DOCUMENT\n\n"
-        for i, page in enumerate(reader.pages[:10], 1):  # Limit pages
-            try:
-                text = page.extract_text()
-                if text and text.strip():
-                    content += f"## Page {i}\n{text[:2000]}\n\n"
-            except:
-                continue
-        return content if content != "# 📄 PDF DOCUMENT\n\n" else "No text extracted from PDF"
+        content = "# 📄 PDF CONTENT\n\n"
+        for i, page in enumerate(reader.pages[:10], 1):
+            text = page.extract_text()
+            if text:
+                content += f"## Page {i}\n{text[:2000]}\n\n"
+        return content
     except Exception as e:
-        return f"Error parsing PDF: {str(e)}"
+        return f"Error parsing PDF: {e}"
 
 @st.cache_data
 def process_uploaded_file(uploaded_file):
-    """Process uploaded file and extract content"""
-    file_name = uploaded_file.name.lower()
-    file_content = uploaded_file.read()
+    """Process uploaded file to extract text"""
+    name = uploaded_file.name.lower()
+    buf = uploaded_file.read()
     uploaded_file.seek(0)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_name).suffix) as tmp:
-        tmp.write(file_content)
-        tmp_path = tmp.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(name).suffix) as tmp:
+        tmp.write(buf)
+        path = tmp.name
     try:
-        if file_name.endswith('.ipynb'):
-            nb = nbformat.read(tmp_path, as_version=4)
+        if name.endswith(".ipynb"):
+            nb = nbformat.read(path, as_version=4)
             return extract_notebook_content(nb)
-        elif file_name.endswith(('.txt', '.py', '.md', '.r', '.js', '.cpp', '.java', '.json')):
-            return extract_text_content(tmp_path, file_name)
-        elif file_name.endswith('.pdf'):
-            return extract_pdf_content(tmp_path)
+        elif name.endswith((".txt", ".py", ".md", ".r", ".js", ".cpp", ".java", ".json")):
+            return extract_text_content(path, name)
+        elif name.endswith(".pdf"):
+            return extract_pdf_content(path)
         else:
-            return f"Unsupported file: {file_name}"
+            return "Unsupported file type"
     finally:
-        os.unlink(tmp_path)
+        os.unlink(path)
 
-def generate_ai_response(prompt, context):
-    """Generate response using Gemini with file context"""
-    try:
-        system_prompt = f"""
-You are an expert document analysis assistant. Answer questions based ONLY on the provided context.
-Be specific, reference code sections, explain concepts clearly, and provide helpful insights.
+# ---------------- Gemini Response with Retry ----------------
+def generate_ai_response(prompt, context, retries=3):
+    """Generates response with rate‑limit (429) handling"""
+    system_prompt = f"""
+You are an expert assistant. Analyze and answer using ONLY this context.
 
-CONTEXT FROM UPLOADED FILE:
+CONTEXT:
 {context}
 
-USER QUESTION: {prompt}
-
-Respond helpfully and accurately using only the context above.
+QUESTION:
+{prompt}
 """
-        response = model.generate_content(system_prompt)
-        return response.text
-    except Exception as e:
-        return f"Error generating response: {str(e)}"
+    for attempt in range(retries):
+        try:
+            response = model.generate_content(system_prompt)
+            return response.text
+        except Exception as e:
+            if "429" in str(e):  # Rate limit exceeded
+                wait_time = min(60, (attempt + 1) * 20)
+                st.warning(f"⚠️ Rate limit hit — retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            return f"Error generating response: {e}"
+    return "⚠️ Still over rate limit. Please wait a minute and retry."
 
-# Streamlit UI
-st.set_page_config(
-    page_title="Notebook LLM",
-    page_icon="📓",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ---------------- Streamlit Interface ----------------
+st.set_page_config(page_title="Notebook LLM", page_icon="📓", layout="wide")
 
-st.title("📓 Notebook LLM - AI Document Assistant")
-st.markdown("Upload files and chat about their content using Google Gemini 2.0!")
+st.title("📓 Notebook LLM (Gemini 2.0 Flash‑Lite)")
+st.caption("Chat about notebooks or PDFs — handles Gemini rate limits automatically.")
 
-# Sidebar
 with st.sidebar:
     st.header("⚙️ Configuration")
-    st.subheader("Supported Formats")
     st.markdown("""
-    - 📓 Jupyter `.ipynb`
-    - 💻 Code `.py`, `.js`, `.cpp`, `.java`, `.R`, `.json`
-    - 📝 Text `.txt`, `.md`
-    - 📄 PDF `.pdf`
-    """)
-    st.markdown("---")
-    st.info("🆓 Free Tier: 15-60 RPM, 1M tokens")
-    if st.button("🔑 Get API Key"):
-        st.markdown("[Google AI Studio](https://aistudio.google.com/app/apikey)")
-    st.markdown("---")
-    if st.button("ℹ️ Tips"):
-        st.markdown("""
-        **Great prompts:**
-        - "Summarize this notebook"
-        - "Explain the main algorithm"
-        - "What libraries are used?"
-        - "Debug this code"
-        - "Generate similar examples"
-        """)
+**Supported Files:**
+- 📓 `.ipynb`
+- 💻 `.py`, `.js`, `.cpp`, `.java`, `.R`, `.json`
+- 📝 `.txt`, `.md`
+- 📄 `.pdf`
+""")
+    st.info("💡 Free Tier: 30 requests/minute, 1 M tokens with Flash‑Lite")
 
-# Main content
-col1, col2 = st.columns([3, 1])
+uploaded_file = st.file_uploader("📁 Upload Document", type=[
+    "ipynb", "py", "txt", "md", "r", "js", "cpp", "java", "json", "pdf"
+])
 
-with col1:
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "📁 Upload Document",
-        type=['ipynb', 'py', 'txt', 'md', 'r', 'js', 'cpp', 'java', 'json', 'pdf'],
-        help="Choose a file to analyze"
-    )
-
-with col2:
-    st.info("💡 Example Questions:")
-    examples = [
-        "Summarize this document",
-        "Explain the main function",
-        "What does this code do?",
-        "Find bugs or issues"
-    ]
-    for example in examples:
-        st.write(f"• {example}")
-
-# Session state initialization
 if "file_content" not in st.session_state:
     st.session_state.file_content = ""
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "filename" not in st.session_state:
-    st.session_state.filename = ""
 
-# File processing
-if uploaded_file is not None:
-    with st.spinner("🔄 Processing file..."):
-        content = process_uploaded_file(uploaded_file)
-        st.session_state.file_content = content
-        st.session_state.filename = uploaded_file.name
+if uploaded_file:
+    with st.spinner("Processing file..."):
+        data = process_uploaded_file(uploaded_file)
+        st.session_state.file_content = data
+        st.success(f"✅ File loaded: {uploaded_file.name}")
 
-    if not content.startswith(("Error", "Unsupported")):
-        st.success(f"✅ Loaded: **{st.session_state.filename}**")
+    with st.expander("📄 Document Preview"):
+        st.text_area("Extracted content", data[:4000], height=300, disabled=True)
 
-        # File preview
-        with st.expander("📋 Document Preview", expanded=False):
-            st.text_area(
-                "Content",
-                st.session_state.file_content[:4000],
-                height=300,
-                disabled=True
-            )
+    # Chat
+    st.subheader("💬 Ask Questions About the File")
+    for msg in st.session_state.messages[-8:]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-        # Chat interface
-        st.subheader("💬 Ask Questions About Your File")
+    if prompt := st.chat_input("Ask about your document..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("assistant"):
+            with st.spinner("🤖 Analyzing..."):
+                result = generate_ai_response(prompt, st.session_state.file_content)
+                st.markdown(result)
+        st.session_state.messages.append({"role": "assistant", "content": result})
 
-        # Chat history
-        for msg in st.session_state.messages[-8:]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button("🗑️ Clear Chat"):
+            st.session_state.messages = []
+            st.rerun()
+    with cols[1]:
+        if st.button("🔄 Reprocess File"):
+            st.session_state.file_content = ""
+            st.rerun()
 
-        # Chat input
-        if prompt := st.chat_input("Ask about your document..."):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
+else:
+    st.info("📂 Upload a notebook, script, or PDF to begin.")
 
-            with st.chat_message("assistant"):
-                with st.spinner("🤔 Analyzing..."):
-                    response = generate_ai_response(prompt, st.session_state.file_content)
-                    st.markdown(response)
-
-                st.session_state.messages.append({"role": "assistant", "content": response})
-
-        # Controls
-        col_btn1, col_btn2 = st.columns(2)
-        with col_btn1:
-            if st.button("🗑️ Clear Chat"):
-                st.session_state.messages = []
-                st.experimental_rerun()
-        with col_btn2:
-            if st.button("🔄 Reprocess File"):
-                st.session_state.file_content = ""
-                st.experimental_rerun()
-    else:
-        st.error(f"❌ {content}")
-
-# Welcome message
-if not st.session_state.file_content or uploaded_file is None:
-    st.info("""
-    🚀 Get Started:
-    1. Upload a Jupyter notebook, code file, PDF, or text document
-    2. Wait for content extraction
-    3. Ask questions in the chat below
-    4. Get AI-powered analysis!
-    """)
-
-# Footer
 st.markdown("---")
-st.markdown(
-    """
-    📓 Notebook LLM | Powered by Streamlit + Google Gemini 2.0
-    Updated for October 2025 | Free tier compatible 
-    """, unsafe_allow_html=True)
+st.caption("Updated October 2025 • Handles 429 errors • Gemini 2.0 Flash‑Lite ready.")
