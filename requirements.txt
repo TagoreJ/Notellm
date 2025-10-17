@@ -7,3 +7,5 @@ requests>=2.31.0
 Pillow>=10.0.0
 numpy>=1.24.0
 gtts>=2.4.0
+transformers>=4.40.0
+torch>=2.0.0  # or tensorflow, depending on your backend setup
