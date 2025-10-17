@@ -2,6 +2,7 @@ import streamlit as st
 import tempfile
 import time
 import re
+from PyPDF2 import PdfReader
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Chroma
@@ -10,12 +11,12 @@ from langchain.chains import RetrievalQA
 from langchain.llms import HuggingFacePipeline
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 
-# Load LLMs and models once
+# === Model loading with caching ===
 @st.cache_resource(show_spinner=False)
 def load_distilgpt2():
     tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
     model = AutoModelForCausalLM.from_pretrained("distilgpt2")
-    return pipeline('text-generation', model=model, tokenizer=tokenizer)
+    return pipeline("text-generation", model=model, tokenizer=tokenizer)
 
 @st.cache_resource(show_spinner=False)
 def load_bart_summarizer():
@@ -28,14 +29,9 @@ def load_embeddings():
 @st.cache_resource(show_spinner=False)
 def create_chroma_collection():
     import chromadb
-    from chromadb.config import Settings
-    
-    client = chromadb.Client(Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory=".chromadb"
-    ))
-    return client.get_or_create_collection(name="pdf_chunks", embedding_function=None)
-
+    client = chromadb.Client()
+    collection = client.get_or_create_collection("pdf_chunks")
+    return collection
 
 def filter_redundant_sentences(text):
     sentences = re.split(r'(?<=[.?!])\s+', text)
@@ -46,26 +42,23 @@ def filter_redundant_sentences(text):
         if s and s not in seen:
             filtered.append(s)
             seen.add(s)
-    return ' '.join(filtered)
-
+    return " ".join(filtered)
 
 def summarize_text(text, summarizer):
     progress = st.progress(0, text="Summarizing with BART...")
     for i in range(5):
         time.sleep(0.2)
         progress.progress((i + 1) * 20)
-    summary = summarizer(text, max_length=150, min_length=30, do_sample=False)[0]['summary_text']
+    summary = summarizer(text, max_length=150, min_length=30, do_sample=False)[0]["summary_text"]
     progress.progress(100, text="Summary complete")
     return summary
 
-
-st.title("📚 Local PDF Q&A with LangChain + DistilGPT2 + Chroma")
+st.title("📄 Local PDF QA App with LangChain + Chroma (Streamlit Cloud Ready)")
 
 uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
 
-if uploaded_pdf:
-
-    # Save uploaded PDF to temp file for PyPDFLoader
+if uploaded_pdf is not None:
+    # Save to temp file for PyPDFLoader
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         tmp_file.write(uploaded_pdf.read())
         tmp_path = tmp_file.name
@@ -77,40 +70,41 @@ if uploaded_pdf:
     texts = splitter.split_documents(docs)
 
     embeddings = load_embeddings()
+    chunk_embeddings = [embeddings.embed(t.page_content) for t in texts]
 
     collection = create_chroma_collection()
-    # Clear any previous records before adding new docs
+    # Clear existing contents before adding new
     collection.delete(where={})
-    collection.add(documents=texts, embeddings=[embeddings.embed(t) for t in texts])
-    collection.persist()
+    collection.add(documents=[t.page_content for t in texts], embeddings=chunk_embeddings)
 
     distilgpt2 = load_distilgpt2()
     bart_summarizer = load_bart_summarizer()
 
     local_llm = HuggingFacePipeline(pipeline=distilgpt2)
-    qa = RetrievalQA.from_chain_type(llm=local_llm, retriever=collection.as_retriever())
+    qa_chain = RetrievalQA.from_chain_type(llm=local_llm, retriever=collection.as_retriever())
 
-    query = st.text_input("Ask a question about your PDF:")
+    query = st.text_input("Ask a question about the PDF:")
 
     if query:
-        start = time.time()
-        raw_answer = qa.run(query)
-        elapsed = time.time() - start
+        start_time = time.time()
+        with st.spinner("Generating answer..."):
+            raw_answer = qa_chain.run(query)
+        elapsed = time.time() - start_time
 
-        option = st.radio("Refine answer with BART summarizer?", ("No", "Yes"))
+        refine = st.radio("Refine answer with BART summarizer?", ("No", "Yes"))
         final_answer = raw_answer
 
-        if option == "Yes":
+        if refine == "Yes":
             final_answer = summarize_text(raw_answer, bart_summarizer)
 
         final_answer = filter_redundant_sentences(final_answer)
 
         st.markdown("### Answer:")
         st.write(final_answer)
-        st.caption(f"⏳ Generated in {elapsed:.2f} seconds")
+        st.caption(f"⏰ Answer generated in {elapsed:.2f} seconds")
 
 else:
-    st.info("Upload a PDF to start question answering.")
+    st.info("Upload a PDF file to begin question answering.")
 
 st.markdown("---")
-st.caption("Local LangChain PDF QA with DistilGPT2 + Chroma | October 2025")
+st.caption("By [Your Name] — Local LangChain + DistilGPT2 + Chroma RAG | Optimized for Streamlit Cloud")
