@@ -6,7 +6,7 @@ from PyPDF2 import PdfReader
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Chroma
-from langchain.embeddings import SentenceTransformerEmbeddings
+from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQA
 from langchain.llms import HuggingFacePipeline
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
@@ -24,7 +24,7 @@ def load_bart_summarizer():
 
 @st.cache_resource(show_spinner=False)
 def load_embeddings():
-    return SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 @st.cache_resource(show_spinner=False)
 def create_chroma_collection():
@@ -53,12 +53,11 @@ def summarize_text(text, summarizer):
     progress.progress(100, text="Summary complete")
     return summary
 
-st.title("📄 Local PDF QA App with LangChain + Chroma (Streamlit Cloud Ready)")
+st.title("📄 Local PDF QA with LangChain + DistilGPT2 + Chroma (Fixed)")
 
 uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
 
 if uploaded_pdf is not None:
-    # Save to temp file for PyPDFLoader
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         tmp_file.write(uploaded_pdf.read())
         tmp_path = tmp_file.name
@@ -70,12 +69,14 @@ if uploaded_pdf is not None:
     texts = splitter.split_documents(docs)
 
     embeddings = load_embeddings()
-    chunk_embeddings = [embeddings.embed(t.page_content) for t in texts]
+    chunk_embeddings = embeddings.embed_documents([t.page_content for t in texts])
 
     collection = create_chroma_collection()
-    # Clear existing contents before adding new
+
+    # Clear old docs before adding new
     collection.delete(where={})
     collection.add(documents=[t.page_content for t in texts], embeddings=chunk_embeddings)
+    collection.persist()
 
     distilgpt2 = load_distilgpt2()
     bart_summarizer = load_bart_summarizer()
@@ -87,24 +88,23 @@ if uploaded_pdf is not None:
 
     if query:
         start_time = time.time()
-        with st.spinner("Generating answer..."):
-            raw_answer = qa_chain.run(query)
+        raw_answer = qa_chain.run(query)
         elapsed = time.time() - start_time
 
-        refine = st.radio("Refine answer with BART summarizer?", ("No", "Yes"))
+        option = st.radio("Refine answer with BART summarizer?", ("No", "Yes"))
         final_answer = raw_answer
 
-        if refine == "Yes":
+        if option == "Yes":
             final_answer = summarize_text(raw_answer, bart_summarizer)
 
         final_answer = filter_redundant_sentences(final_answer)
 
         st.markdown("### Answer:")
         st.write(final_answer)
-        st.caption(f"⏰ Answer generated in {elapsed:.2f} seconds")
+        st.caption(f"⏳ Generated in {elapsed:.2f} seconds")
 
 else:
-    st.info("Upload a PDF file to begin question answering.")
+    st.info("Upload a PDF to start question answering with LangChain.")
 
 st.markdown("---")
-st.caption("By [Your Name] — Local LangChain + DistilGPT2 + Chroma RAG | Optimized for Streamlit Cloud")
+st.caption("Local LangChain PDF QA with DistilGPT2 + Chroma | October 2025")
