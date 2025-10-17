@@ -13,4 +13,4 @@ sentence-transformers>=2.2.2
 faiss-cpu>=1.7.3
 langchain>=0.0.195
 chromadb>=0.4.10
-
+langchain_community
